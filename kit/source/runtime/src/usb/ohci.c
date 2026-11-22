@@ -18,6 +18,10 @@
 #include <stddef.h>
 #if defined(_WIN32)
 #include "ohci_tick_timer.h"
+#elif defined(__aarch64__)
+#include "../platform/posix_mmio.h"
+#include <pthread.h>
+#include <unistd.h>
 #endif
 
 /* The runtime maps guest memory at a fixed host offset. */
@@ -173,6 +177,22 @@ static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_enabled;
 static int s_trace;
+static size_t s_trap_bytes = XBOX_OHCI_SIZE;
+static int s_init_done;
+static volatile LONG s_stop;
+static HANDLE s_worker;
+static DWORD s_previous_protection[2];
+static int s_trapped[2];
+
+#if defined(__aarch64__) && !defined(_WIN32)
+static pthread_mutex_t s_ohci_lock = PTHREAD_MUTEX_INITIALIZER;
+static int s_worker_status; /* 0 starting, 1 running, -1 exited */
+#define OHCI_LOCK() pthread_mutex_lock(&s_ohci_lock)
+#define OHCI_UNLOCK() pthread_mutex_unlock(&s_ohci_lock)
+#else
+#define OHCI_LOCK() ((void)0)
+#define OHCI_UNLOCK() ((void)0)
+#endif
 
 /* Guest MMIO and the bus worker update these words concurrently. In
  * particular, acknowledging WDH must not erase a newly raised root-hub/SOF
@@ -239,6 +259,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
     uint32_t aligned = off & ~3u;
     volatile uint32_t *r = reg_of(hc, aligned);
     uint32_t v = (uint32_t)val;
+    if (size < 4) v <<= (off & 3u) * 8u;
 
     hc->writes++;
     if (!r)
@@ -370,7 +391,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
     } else {
         unsigned shift = (off & 3u) * 8u;
         uint32_t mask = ((size == 1) ? 0xFFu : 0xFFFFu) << shift;
-        *r = (*r & ~mask) | ((v << shift) & mask);
+        *r = (*r & ~mask) | (v & mask);
     }
 }
 
@@ -918,6 +939,17 @@ static int ohci_call_isr(OhciController *hc)
         return -1;
     }
 
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (!xbox_PosixMmioRegisterThread()) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "  [OHCI] cannot register IRQ thread for POSIX MMIO\n");
+        }
+        xbox_worker_stack_free(slot);
+        return -1;
+    }
+#endif
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
 
@@ -931,6 +963,9 @@ static int ohci_call_isr(OhciController *hc)
         xbox_InterruptLeave(OHCI_IRQ(hc), saved);
     }
 
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (!xbox_PosixMmioUnregisterThread()) abort();
+#endif
     xbox_worker_stack_free(slot);
     return (int)(g_eax & 1u);
 }
@@ -943,13 +978,16 @@ static int ohci_call_isr(OhciController *hc)
  */
 static void ohci_raise(OhciController *hc, uint32_t source)
 {
-    uint32_t enable = hc->reg[HcInterruptEnable / 4];
+    uint32_t enable;
     int claimed;
 
     /* The bus already published the source. The DPC may have acknowledged
      * the loop's earlier snapshot in the meantime: reasserting it here
      * creates a WDH interrupt with an empty, already consumed done queue. */
+    OHCI_LOCK();
+    enable = hc->reg[HcInterruptEnable / 4];
     source = hc->reg[HcInterruptStatus / 4] & enable & 0x7Fu;
+    OHCI_UNLOCK();
 
     if (!(enable & INTR_MIE) || !(enable & source))
         return;
@@ -1084,12 +1122,30 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             fprintf(stderr, "  [OHCI0] no TIB for the controller thread; "
                             "not delivering interrupts\n");
             fflush(stderr);
+#if defined(__aarch64__) && !defined(_WIN32)
+            OHCI_LOCK();
+            __atomic_store_n(&s_worker_status, -1, __ATOMIC_RELEASE);
+            OHCI_UNLOCK();
+#endif
             return 0;
         }
         g_fs_base = tib;
     }
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (!xbox_PosixMmioRegisterThread()) {
+        fprintf(stderr, "  [OHCI] controller thread cannot register for POSIX MMIO\n");
+        OHCI_LOCK();
+        __atomic_store_n(&s_worker_status, -1, __ATOMIC_RELEASE);
+        OHCI_UNLOCK();
+        return 0;
+    }
+    if (!xbox_PosixMmioUnregisterThread()) abort();
+    OHCI_LOCK();
+    __atomic_store_n(&s_worker_status, 1, __ATOMIC_RELEASE);
+    OHCI_UNLOCK();
+#endif
 
-    for (;;) {
+    while (!InterlockedCompareExchange(&s_stop, 0, 0)) {
         OhciController *hc = &s_hc[s_device_hc];
         uint32_t control, enable, status;
         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
@@ -1101,6 +1157,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         Sleep(OHCI_TICK_MS);
         elapsed_ms = OHCI_TICK_MS;
 #endif
+        OHCI_LOCK();
         /* Both operational controllers have a frame clock, even when only
          * one carries a device. Master interrupt masking does not stop it. */
         ohci_advance_frames(&s_hc[0], elapsed_ms);
@@ -1112,8 +1169,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
             waited += elapsed_ms;
-            if (waited > 30000)               /* 30 s and it never started */
+            if (waited > 30000) {             /* 30 s and it never started */
+#if defined(__aarch64__) && !defined(_WIN32)
+                __atomic_store_n(&s_worker_status, -1, __ATOMIC_RELEASE);
+#endif
+                OHCI_UNLOCK();
                 break;
+            }
+            OHCI_UNLOCK();
             continue;
         }
         /* MIE masks interrupt delivery, not the USB bus/frame clock. */
@@ -1228,11 +1291,15 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * so rather than spinning the ISR forever. */
     deliver:
         enable = hc->reg[HcInterruptEnable / 4];
-        if (!(enable & INTR_MIE))
+        if (!(enable & INTR_MIE)) {
+            OHCI_UNLOCK();
             continue;
+        }
         status = hc->reg[HcInterruptStatus / 4] & enable & 0x7Fu;
-        if (!status)
+        if (!status) {
+            OHCI_UNLOCK();
             continue;
+        }
 
         /* Keep the level-triggered source pending until its device priority
          * is unmasked. A DPC at level 2 must not stall hardware at level 26. */
@@ -1244,6 +1311,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                         hc->index, xbox_IrqlRaisedCount(), status);
                 fflush(stderr);
             }
+            OHCI_UNLOCK();
             continue;
         }
         held_off = 0;
@@ -1267,6 +1335,10 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                                 "with no acknowledgement; stopping\n",
                         hc->index, status);
                 fflush(stderr);
+#if defined(__aarch64__) && !defined(_WIN32)
+                __atomic_store_n(&s_worker_status, -1, __ATOMIC_RELEASE);
+#endif
+                OHCI_UNLOCK();
                 break;
             }
         } else {
@@ -1274,21 +1346,24 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             last_ack    = hc->ack_seq;
             repeats     = 0;
         }
+        OHCI_UNLOCK();
         ohci_raise(hc, status);
     }
 #if defined(_WIN32)
     ohci_tick_timer_close(&tick_timer);
+#elif defined(__aarch64__)
+    OHCI_LOCK();
+    __atomic_store_n(&s_worker_status, -1, __ATOMIC_RELEASE);
+    OHCI_UNLOCK();
 #endif
     return 0;
 }
 
 void xbox_OhciInit(void)
 {
-    static int done;
-
-    if (done)
+    if (s_init_done)
         return;
-    done = 1;
+    s_init_done = 1;
 
     /* Opt-in. Without a descriptor list walker behind it a driver that finds
      * a port has nothing to enumerate, so this must not change how a title
@@ -1296,6 +1371,12 @@ void xbox_OhciInit(void)
     if (!getenv("RECOMP_USB"))
         return;
 
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (!xbox_PosixMmioIsStarted() || !xbox_PosixMmioIsBound()) {
+        fprintf(stderr, "  OHCI: attach the POSIX MMIO broker before trapping pages\n");
+        return;
+    }
+#endif
     s_enabled = 1;
     s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
     {
@@ -1317,7 +1398,6 @@ void xbox_OhciInit(void)
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
 
-#if defined(_WIN32)
     /* The registers have to fault to be answered. The MCPX aperture is mapped
      * as plain committed memory, so both blocks are made inaccessible here and
      * the title's VEH routes the faults back to xbox_OhciHandleMmio.
@@ -1328,48 +1408,172 @@ void xbox_OhciInit(void)
     {
         ptrdiff_t off = xbox_GetMemoryOffset();
         int i;
+        DWORD previous[2] = {0, 0};
 
         if (!off) {
             s_enabled = 0;
             fprintf(stderr, "  OHCI: guest memory not mapped yet; disabled\n");
             return;
         }
+#if !defined(_WIN32)
+#if defined(__aarch64__)
+        long page = sysconf(_SC_PAGESIZE);
+        if (page < XBOX_OHCI_SIZE || page > 0x8000 ||
+            (page & (page - 1)) != 0 ||
+            (XBOX_OHCI0_BASE % (unsigned long)page) != 0 ||
+            (XBOX_OHCI1_BASE % (unsigned long)page) != 0) {
+            s_enabled = 0;
+            fprintf(stderr, "  OHCI: unsupported host page size %ld; disabled\n", page);
+            return;
+        }
+        s_trap_bytes = (size_t)page;
+#else
+        s_enabled = 0;
+        fprintf(stderr, "  OHCI: trapped POSIX MMIO requires an AArch64 decoder; disabled\n");
+        return;
+#endif
+#endif
         for (i = 0; i < 2; i++) {
-            DWORD old_protect;
             LPVOID at = (LPVOID)((uintptr_t)off + s_hc[i].base);
-            if (!VirtualProtect(at, XBOX_OHCI_SIZE, PAGE_NOACCESS,
-                                &old_protect)) {
+            if (!VirtualProtect(at, s_trap_bytes, PAGE_NOACCESS,
+                                &previous[i])) {
+                for (int j = 0; j < i; ++j) {
+                    DWORD ignored;
+                    if (VirtualProtect((LPVOID)((uintptr_t)off + s_hc[j].base),
+                                       s_trap_bytes, previous[j], &ignored))
+                        s_trapped[j] = 0;
+                    else
+                        fprintf(stderr, "  OHCI: failed to restore controller %d page\n", j);
+                }
                 s_enabled = 0;
                 fprintf(stderr, "  OHCI: cannot trap 0x%08X (error %lu); "
-                                "disabled\n", s_hc[i].base, GetLastError());
+                                "disabled\n", s_hc[i].base, (unsigned long)GetLastError());
                 return;
             }
+            s_previous_protection[i] = previous[i];
+            s_trapped[i] = 1;
         }
     }
-#endif
 
     fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X, "
                     "%d ports each, one device on HC0 port 1\n",
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
-#if defined(_WIN32)
     {
-        HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
-        if (th)
-            CloseHandle(th);
+        InterlockedExchange(&s_stop, 0);
+#if defined(__aarch64__) && !defined(_WIN32)
+        __atomic_store_n(&s_worker_status, 0, __ATOMIC_RELAXED);
+#endif
+        s_worker = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
+#if defined(__aarch64__) && !defined(_WIN32)
+        if (s_worker) {
+            for (unsigned i = 0; i < 5000 &&
+                 __atomic_load_n(&s_worker_status, __ATOMIC_ACQUIRE) == 0; ++i)
+                Sleep(1);
+            if (__atomic_load_n(&s_worker_status, __ATOMIC_ACQUIRE) != 1) {
+                InterlockedExchange(&s_stop, 1);
+                if (WaitForSingleObject(s_worker, 5000) != WAIT_OBJECT_0) {
+                    s_enabled = 0;
+                    fprintf(stderr, "  OHCI: controller worker failed to start or stop; pages retained\n");
+                    return;
+                }
+                CloseHandle(s_worker);
+                s_worker = NULL;
+            }
+        }
+#endif
+        if (!s_worker) {
+            DWORD old;
+            ptrdiff_t off = xbox_GetMemoryOffset();
+            s_enabled = 0;
+            for (int i = 0; i < 2; ++i) {
+                if (VirtualProtect((LPVOID)((uintptr_t)off + s_hc[i].base),
+                                   s_trap_bytes, s_previous_protection[i], &old))
+                    s_trapped[i] = 0;
+                else
+                    fprintf(stderr, "  OHCI: failed to restore controller %d page\n", i);
+            }
+            fprintf(stderr, "  OHCI: could not start the controller worker; disabled\n");
+        }
+    }
+}
+
+int xbox_OhciIsEnabled(void)
+{
+#if defined(__aarch64__) && !defined(_WIN32)
+    return s_enabled && s_worker && s_trapped[0] && s_trapped[1] &&
+        __atomic_load_n(&s_worker_status, __ATOMIC_ACQUIRE) == 1;
+#else
+    return s_enabled && s_worker && s_trapped[0] && s_trapped[1];
+#endif
+}
+
+#if defined(XBOXRECOMP_TEST_FAILURES) && defined(__aarch64__) && !defined(_WIN32)
+int xbox_TestOhciStopWorker(void)
+{
+    if (!s_worker) return 0;
+    InterlockedExchange(&s_stop, 1);
+    return WaitForSingleObject(s_worker, 5000) == WAIT_OBJECT_0;
+}
+
+size_t xbox_TestOhciTrapBytes(size_t bytes)
+{
+    OHCI_LOCK();
+    size_t previous = s_trap_bytes;
+    s_trap_bytes = bytes;
+    OHCI_UNLOCK();
+    return previous;
+}
+#endif
+
+int xbox_OhciShutdown(void)
+{
+#if defined(__aarch64__) && !defined(_WIN32)
+    if ((s_worker || s_trapped[0] || s_trapped[1]) &&
+        !xbox_PosixMmioDevicesMayTeardown()) {
+        fprintf(stderr, "  OHCI: seal and stop MMIO producers before stopping the controller\n");
+        return 0;
     }
 #endif
+    if (s_worker) {
+        InterlockedExchange(&s_stop, 1);
+        if (WaitForSingleObject(s_worker, 5000) != WAIT_OBJECT_0) {
+            fprintf(stderr, "  OHCI: worker did not stop; controller pages remain trapped\n");
+            return 0;
+        }
+        CloseHandle(s_worker);
+        s_worker = NULL;
+    }
+    if (s_trapped[0] || s_trapped[1]) {
+        ptrdiff_t off = xbox_GetMemoryOffset();
+        int ok = 1;
+        for (int i = 0; i < 2; ++i) {
+            DWORD ignored;
+            if (!s_trapped[i]) continue;
+            if (!VirtualProtect((LPVOID)((uintptr_t)off + s_hc[i].base),
+                                s_trap_bytes, s_previous_protection[i], &ignored)) {
+                fprintf(stderr, "  OHCI: failed to restore controller %d page\n", i);
+                ok = 0;
+            } else s_trapped[i] = 0;
+        }
+        if (!ok) return 0;
+    }
+    s_enabled = 0;
+    s_init_done = 0;
+    s_trap_bytes = XBOX_OHCI_SIZE;
+    return 1;
 }
 
 static OhciController *hc_for(uint32_t va)
 {
     int i;
 
-    if (!s_enabled)
+    if (!s_enabled && !s_trapped[0] && !s_trapped[1])
         return NULL;
     for (i = 0; i < 2; i++)
-        if (va >= s_hc[i].base && va < s_hc[i].base + XBOX_OHCI_SIZE)
+        if (s_trapped[i] && va >= s_hc[i].base &&
+            (uint64_t)va < (uint64_t)s_hc[i].base + s_trap_bytes)
             return &s_hc[i];
     return NULL;
 }
@@ -1378,6 +1582,77 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
 {
     return hc_for(xbox_va) != NULL;
 }
+
+#if defined(__aarch64__) && !defined(_WIN32)
+int xbox_OhciPosixSameOwner(uint32_t first_va, uint32_t second_va)
+{
+    OhciController *first = hc_for(first_va);
+    return first && first == hc_for(second_va);
+}
+
+static uint64_t ohci_posix_read(void *dev, uint32_t off, int size)
+{
+    OhciController *hc = dev;
+    uint64_t result = 0;
+    for (int i = 0; i < size;) {
+        uint32_t at = off + (uint32_t)i;
+        int n = size - i;
+        int boundary = 4 - (int)(at & 3u);
+        if (n > boundary) n = boundary;
+        if (n == 3) n = 1;
+        uint64_t part;
+        uint32_t base = hc->base - 0xFE800000u;
+        if (at >= base && at - base < XBOX_OHCI_SIZE) {
+            part = ohci_read(hc, at - base, n);
+        } else {
+            volatile uint8_t *p = xbox_McpxMemoryAlias(at, (size_t)n);
+            part = 0;
+            if (p) for (int j = 0; j < n; ++j) part |= (uint64_t)p[j] << (8 * j);
+        }
+        result |= part << (8 * i);
+        i += n;
+    }
+    return result;
+}
+
+static void ohci_posix_write(void *dev, uint32_t off, uint64_t value, int size)
+{
+    OhciController *hc = dev;
+    for (int i = 0; i < size;) {
+        uint32_t at = off + (uint32_t)i;
+        int n = size - i, boundary = 4 - (int)(at & 3u);
+        if (n > boundary) n = boundary;
+        if (n == 3) n = 1;
+        uint64_t part = value >> (8 * i);
+        uint32_t base = hc->base - 0xFE800000u;
+        if (at >= base && at - base < XBOX_OHCI_SIZE) {
+            ohci_write(hc, at - base, part, n);
+        } else {
+            volatile uint8_t *p = xbox_McpxMemoryAlias(at, (size_t)n);
+            if (p) for (int j = 0; j < n; ++j) p[j] = (uint8_t)(part >> (8 * j));
+        }
+        i += n;
+    }
+}
+
+int xbox_OhciPosixRequest(uint32_t fault_va, XboxPosixMmioRequest *request)
+{
+    OHCI_LOCK();
+    OhciController *hc = hc_for(fault_va);
+    if (!hc || __atomic_load_n(&s_worker_status, __ATOMIC_ACQUIRE) != 1 ||
+        InterlockedCompareExchange(&s_stop, 0, 0)) {
+        OHCI_UNLOCK();
+        return 0;
+    }
+    for (unsigned i = 0; i < request->count; ++i) {
+        XboxPosixMmioOp *op = &request->op[i];
+        if (op->write) ohci_posix_write(hc, op->offset, op->value, (int)op->size);
+        else op->value = ohci_posix_read(hc, op->offset, (int)op->size);
+    }
+    OHCI_UNLOCK();
+    return 1;
+}
+#endif
 
 int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
 {
@@ -1398,6 +1673,9 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
         fflush(stderr);
     }
     return ok;
+#elif defined(__aarch64__)
+    if (xbox_va < 0xFE800000u) return 0;
+    return xbox_PosixMmioFaultOffset(ctx, xbox_va - 0xFE800000u);
 #else
     (void)ctx; (void)xbox_va;
     return 0;
@@ -1410,6 +1688,7 @@ void xbox_OhciReport(void)
 
     if (!s_enabled)
         return;
+    OHCI_LOCK();
     for (i = 0; i < 2; i++)
         fprintf(stderr, "  [OHCI%d] %u reads, %u writes, %u undecoded; "
                         "HcControl=%08X HcIntStatus=%08X port1=%08X\n",
@@ -1418,4 +1697,5 @@ void xbox_OhciReport(void)
                 s_hc[i].reg[HcInterruptStatus / 4],
                 s_hc[i].reg[HcRhPortStatus1 / 4]);
     fflush(stderr);
+    OHCI_UNLOCK();
 }

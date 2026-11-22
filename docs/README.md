@@ -11,6 +11,7 @@ copy of the retail disc to build or run anything.
 | [bots.md](bots.md) | The offline bot system: brain, controller, navigation and NavCache, VTOL and BattleArmor, skills, recorder and environment switches. |
 | [editor.md](editor.md) | The scenario editor and custom scenarios: file formats, how the game loads them, automation pipe. |
 | [fact-index.md](fact-index.md) | How to search the fact wiki, address conventions, list of topics. |
+| [apple-silicon/](apple-silicon/README.md) | Apple Silicon port scope, milestones, format and tool inventories, data-type rules, and the port issue register. |
 | [wiki/](wiki/README.md) | The fact wiki itself: 3,305 facts in 37 topics with the scripts to validate, merge and query them. |
 
 Suggested reading order for a new contributor: architecture.md, then fact-index.md (so you can look things up), then the

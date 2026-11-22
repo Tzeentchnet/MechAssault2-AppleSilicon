@@ -7,6 +7,7 @@
 typedef struct {
     uint32_t offset, width, height, pitch, color, addr_u, addr_v, palette, levels, filter;
     uint32_t addr_w, control0, border_color, depth, dimensionality;
+    uint32_t border_source_color;
     int cube, valid;
 } Nv2aGpuTexture;
 

@@ -122,6 +122,7 @@ void ma2_register_dsp_doorbell(uint32_t va)
 void ma2_trace_loading(uint32_t request, uint32_t result, uint32_t completed)
 {
     static unsigned count;
+    uint32_t entry_count;
     if (!ma2_diag(DIAG_LOAD) || count++ % 100 != 0)
         return;
     fprintf(stderr, "[LOAD] request=%08X result=%08X completed=%08X "
@@ -138,6 +139,29 @@ void ma2_trace_loading(uint32_t request, uint32_t result, uint32_t completed)
         for (int i = 0; i < 8; i++)
             fprintf(stderr, " %08X", GUEST32(result + i * 4));
         fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "  scheduler: active=%08X file=%08X ios=%08X "
+                    "bytes=%u expected=%u list=%08X\n",
+            GUEST32(0x4E4D48), GUEST32(0x4A1950),
+            GUEST32(0x4E4D4C), GUEST32(0x4E4D50),
+            GUEST32(0x4E4D60), GUEST32(0x50DC34));
+    entry_count = request >= 0x10000 && request < 0x03FFF000
+        ? GUEST32(request + 0xC) : 0;
+    if (entry_count > 8)
+        entry_count = 8;
+    for (uint32_t i = 0; i < entry_count; i++) {
+        uint32_t entry = request + 0x10 + i * 0x20;
+        uint32_t job = GUEST32(entry + 0x18);
+        fprintf(stderr, "  entry[%u]=%08X flags=%08X completed=%08X "
+                        "hash=%08X job=%08X\n",
+                i, entry, GUEST32(entry), GUEST32(entry + 4),
+                GUEST32(entry + 8), job);
+        if (job >= 0x10000 && job < 0x03FFFF80) {
+            fprintf(stderr, "    job words:");
+            for (int word = 0; word < 16; word++)
+                fprintf(stderr, " %08X", GUEST32(job + word * 4));
+            fprintf(stderr, "\n");
+        }
     }
     fflush(stderr);
 }

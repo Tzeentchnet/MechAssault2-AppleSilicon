@@ -121,7 +121,7 @@
   },
   {
    "id": "attract-screen-no-pc-skip-hook",
-   "title": "The PC movie_skip flag is never read by the Attract Screen, so SPIntro ignores it",
+   "title": "Historical gap: the Attract Screen did not read the PC movie-skip flag",
    "subject": {
     "kind": "function",
     "id": "001F84DE"
@@ -135,8 +135,8 @@
     "pc_input_movie_skip",
     "pc_display_movie_active"
    ],
-   "fact": "The only consumer of pc_input_movie_skip_pending is the hook in sub_001F40B3 (Title/Legal Screen). recomp_manual.c:565 sets the flag on any pad 0 button while pc_display_movie_active, and the quick-test thread in ma2_scenario.c sets it as well, but sub_001F84DE never reads it. So pc_display_movie_active and the flag are true during SPIntro and the 2135-frame movie still plays to the end. The quick-test thread works around it by posting WM_KEYDOWN VK_RETURN after 1.5 s.",
-   "status": "current",
+   "fact": "Before the Apple Silicon movie-skip work, the only consumer of pc_input_movie_skip_pending was the hook in sub_001F40B3 (Title/Legal Screen). sub_001F84DE did not read it, so SPIntro ignored the PC flag and a quick-test thread had to post Return. The generated patch now adds the missing Attract Screen consumer.",
+   "status": "superseded",
    "confidence": "code-confirmed",
    "source": [
     {
@@ -168,7 +168,7 @@
   },
   {
    "id": "attract-skip-hook-recommended",
-   "title": "Proposed hook: honour the skip flag in sub_001F84DE and jump to loc_001F8521",
+   "title": "The Attract Screen now consumes a rearmed PC movie-skip request",
    "subject": {
     "kind": "patch",
     "id": "001F84DE"
@@ -181,9 +181,9 @@
    "related": [
     "sub_001F40B3"
    ],
-   "fact": "In recomp_0052.c sub_001F84DE, right after the movie-null check and before loc_001F84E7, add: if(pc_input_movie_skip_pending(1))goto loc_001F8521; That is exactly what a button press does (return 2), so the caller leaves the Attract Screen and slot 15 releases the movie. No seek or stop is needed because this class has none (the 001F40B3 hook uses loc_001F40F6 only because that class closes the movie itself). It also makes the idle attract demo and ConquestIntro skippable. Not applied yet.",
-   "status": "open-question",
-   "confidence": "inferred",
+   "fact": "The generated patch rearms safe-start in sub_001F8439, then sub_001F84DE checks pc_input_movie_skip_pending(1) immediately after the movie-null test and jumps to loc_001F8521. That is the screen's normal result 2, so its existing exit slot releases the movie. The request is consumed once rather than repeated every update. The same lifecycle rule applies to startup movies and native outermost fullscreen movies.",
+   "status": "current",
+   "confidence": "code-confirmed",
    "source": [
     {
      "file": "generated recomp_0052.c (made at install time, not in the repository)",
@@ -192,6 +192,14 @@
     {
      "file": "generated recomp_0051.c (made at install time, not in the repository)",
      "line": 33742
+    },
+    {
+     "file": "kit/patches/diff/recomp_0052.c.json",
+     "line": 1
+    },
+    {
+     "file": "kit/source/runtime/src/platform/pc_frontend.c",
+     "line": 101
     }
    ],
    "tags": [
@@ -199,7 +207,7 @@
     "skip",
     "proposal"
    ],
-   "date": "2026-10-21"
+   "date": "2026-11-21"
   },
   {
    "id": "title-legal-update-1f40b3-shape",

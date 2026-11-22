@@ -202,7 +202,29 @@ uint32_t xbox_ContiguousBlockSize(uint32_t addr);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* Stop guest/device workers, including OHCI, and the POSIX MMIO broker before
+ * releasing an attached layout.
+ * The checked form returns FALSE and permits a retry when cleanup fails.
+ * The original void form logs failures but cannot report them to its caller. */
+BOOL xbox_MemoryLayoutShutdownChecked(void);
 void xbox_MemoryLayoutShutdown(void);
+
+/* Unprotected alias of the MCPX backing for host devices and fault dispatch.
+ * The offset is relative to guest 0xFE800000. Returns NULL when unavailable
+ * or when the requested range crosses the aperture. */
+void *xbox_McpxMemoryAlias(uint32_t offset, size_t bytes);
+
+/* Translate a complete range in ordinary, contiguous, mirrored or tiled RAM.
+ * Returns NULL for overflow, unmapped ranges and device register apertures. */
+void *xbox_TranslateMappedRam(uint32_t address, size_t bytes);
+
+#if defined(__aarch64__) && !defined(_WIN32)
+int xbox_Ac97OwnsAddress(uint32_t xbox_va);
+int xbox_Ac97HandleMmio(void *context, uint32_t xbox_va);
+/* Broker thread only; the complete range is validated before dispatch. */
+void xbox_Ac97PosixAccess(uint32_t offset, uint64_t *value, unsigned size, int write);
+int xbox_ApuMmioOwnsAddress(uint32_t xbox_va);
+#endif
 
 /**
  * Check if an address falls within the Xbox memory map.

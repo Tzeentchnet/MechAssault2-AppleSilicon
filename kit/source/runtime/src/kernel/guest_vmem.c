@@ -88,7 +88,7 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top)
         bytes = 0;
     if (!bytes) {
         fprintf(stderr, "  Extended VMA: could not reserve host memory at %p (error %lu);"
-                        " the tracker stays off\n", host, GetLastError());
+                        " the tracker stays off\n", host, (unsigned long)GetLastError());
         return 0;
     }
     s_top = s_lo + (uint32_t)bytes;
@@ -104,12 +104,16 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top)
     return 1;
 }
 
-void guest_vmem_shutdown(void)
+int guest_vmem_shutdown(void)
 {
-    if (s_pages)
-        VirtualFree((void *)((uintptr_t)s_lo + (uintptr_t)s_offset), 0, MEM_RELEASE);
+    if (s_pages && !VirtualFree((void *)((uintptr_t)s_lo + (uintptr_t)s_offset), 0, MEM_RELEASE)) {
+        fprintf(stderr, "guest_vmem: could not release reservation (error %lu)\n",
+                (unsigned long)GetLastError());
+        return 0;
+    }
     free(s_pages);
     s_pages = NULL;
+    return 1;
 }
 
 /* Commits [start, end) of the host reservation. Zeroes the pages, as
@@ -120,7 +124,7 @@ static int extvma_commit(uint32_t start, uint32_t end)
 
     if (!VirtualAlloc(host, (SIZE_T)(end - start), MEM_COMMIT, PAGE_READWRITE)) {
         fprintf(stderr, "guest_vmem: failed to commit %p (%u bytes, error %lu)\n",
-                host, end - start, GetLastError());
+                host, end - start, (unsigned long)GetLastError());
         return 0;
     }
     return 1;

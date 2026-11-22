@@ -1,5 +1,6 @@
 #ifndef NV2A_TEXTURE_H
 #define NV2A_TEXTURE_H
+#include <stddef.h>
 #include "nv2a_gpu_d3d11.h"
 
 uint32_t nv2a_texture_texel_bytes(uint32_t format);

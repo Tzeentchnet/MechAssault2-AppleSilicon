@@ -947,16 +947,4 @@ void xbox_FramebufferWindowStart(void)
         InterlockedExchange(&s_fb_running, 0);
 }
 
-#else
-void *xbox_FramebufferWindowHandle(void) { return NULL; }
-void xbox_FramebufferWindowHardware(int enabled) { (void)enabled; }
-void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowStart(void) {}
-int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
-void xbox_FramebufferAcknowledgeKey(int vk) { (void)vk; }
-void xbox_FramebufferMouseDelta(int *dx, int *dy) { *dx = 0; *dy = 0; }
-void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
-void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
-LONG xbox_FramebufferFlipCount(void) { return 0; }
 #endif

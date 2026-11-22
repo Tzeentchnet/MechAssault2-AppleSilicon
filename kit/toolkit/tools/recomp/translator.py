@@ -181,7 +181,7 @@ def _edge_flag_plan(bb, sources, known):
 
 
 def write_if_changed(path, text):
-    """Write text to path only when it differs from what is already there.
+    """Write UTF-8/CRLF text only when its exact bytes differ.
 
     Every regen rewrites all 54 chunks of generated C. If the bytes are
     identical the mtime bump still forces the compiler to redo the whole
@@ -190,14 +190,15 @@ def write_if_changed(path, text):
 
     Returns True if the file was written.
     """
+    data = text.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8")
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            if f.read() == text:
+        with open(path, "rb") as f:
+            if f.read() == data:
                 return False
     except OSError:
         pass
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+    with open(path, "wb") as f:
+        f.write(data)
     return True
 
 
@@ -2821,7 +2822,7 @@ class BatchTranslator:
             output_file = os.path.join(self.output_dir, "recompiled.c")
 
         output_text = "\n".join(c_chunks)
-        with open(output_file, "w", encoding="utf-8") as f:
+        with open(output_file, "w", encoding="utf-8", newline="\r\n") as f:
             f.write(output_text)
 
         stats["output_file"] = output_file
@@ -3019,15 +3020,10 @@ class BatchTranslator:
         try:
             with open(types_src, "r", encoding="utf-8") as src:
                 want = src.read()
-            have = None
-            if os.path.exists(types_dst):
-                with open(types_dst, "r", encoding="utf-8") as dst:
-                    have = dst.read()
-            if have != want:
-                with open(types_dst, "w", encoding="utf-8") as dst:
-                    dst.write(want)
+            had_types = os.path.exists(types_dst)
+            if write_if_changed(types_dst, want):
                 print("  %s recomp_types.h (runtime register model)"
-                      % ("refreshed" if have is not None else "wrote"),
+                      % ("refreshed" if had_types else "wrote"),
                       file=sys.stderr)
         except OSError as e:
             print(f"  WARNING: could not write recomp_types.h ({e}); copy "

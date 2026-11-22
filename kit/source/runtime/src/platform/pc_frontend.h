@@ -42,9 +42,11 @@ enum PcCinematicView { PC_CINEMATIC_PILLARBOX, PC_CINEMATIC_FILL_16_9, PC_CINEMA
 void pc_display_cinematic_config(int view, int fps);
 /* Widest aspect a shot may be shown at while a fill view is active (0 = no fill view). */
 float pc_display_cinematic_fill_cap(void);
-/* A skip received by the guest remains queued until the fullscreen player
- * handles it. Console first-view/profile gates do not apply to PC startup. */
+/* A user skip remains queued until the fullscreen player handles it.
+ * RECOMP_SAFE_START is rearmed once for each outermost movie lifecycle.
+ * Console first-view/profile gates do not apply. */
 void pc_input_movie_skip(void);
+void pc_input_movie_skip_rearm(void);
 int pc_input_movie_skip_pending(int acknowledge);
 unsigned pc_display_render_width(unsigned width, unsigned scale);
 enum PcBinding { PC_START, PC_BACK, PC_A, PC_B, PC_X, PC_Y, PC_WHITE, PC_BLACK,

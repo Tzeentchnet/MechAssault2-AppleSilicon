@@ -31,6 +31,9 @@
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include "../platform/pc_cpu_topo.h"   /* T1-0: thread roles for [PERF-CPU] */
+#if defined(__aarch64__) && !defined(_WIN32)
+#include "../platform/posix_mmio.h"
+#endif
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -443,13 +446,14 @@ RECOMP_TLS uint32_t g_xbox_kernel_caller;
  * This is correct because on Xbox, the entry point creates a system
  * thread and returns, and the thread runs the actual game.
  */
-static int g_thread_call_count = 0;
+static volatile LONG g_thread_call_count = 0;
 
 /* Thread entry shim. Sets up the new thread's own simulated stack, pushes the
  * two Xbox start-context arguments plus the dummy return address the callee's
  * `ret` consumes, and runs. */
 /* Set on threads this bridge spawned; see PsTerminateSystemThread. */
 static RECOMP_TLS int g_is_spawned_thread = 0;
+static RECOMP_TLS int g_thread_mmio_registered = 0;
 
 /* This thread's simulated stack, so both exits can give it back. Thread-local
  * for the obvious reason, and needed at all because the common exit is
@@ -459,7 +463,7 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 
 struct bridge_thread_start {
     recomp_func_t fn;
-    uint32_t ctx1, ctx2, stack_top;
+    uint32_t ctx1, ctx2, stack_top, tib;
 };
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
@@ -495,15 +499,23 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     g_is_spawned_thread = 1;
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
-    {
-        uint32_t tib = xbox_AllocThreadTib();
-        if (tib)
-            g_fs_base = tib;
-        else
-            fprintf(stderr, "  [KERNEL] worker thread has no TIB of its own;"
-                            " it shares the main thread's\n");
-    }
+    g_fs_base = s->tib;
     free(s);
+
+#if defined(__aarch64__) && !defined(_WIN32)
+    int mmio_started = xbox_PosixMmioIsStarted();
+    if (mmio_started && !xbox_PosixMmioRegisterThread()) {
+        fprintf(stderr, "  [KERNEL] worker thread could not register for MMIO faults\n");
+        fflush(stderr);
+        xbox_FreeThreadStack(g_thread_stack_top);
+        g_thread_stack_top = 0;
+        xbox_HeapFree(g_fs_base);
+        g_fs_base = XBOX_TIB_MAIN;
+        pc_thread_role_leave();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    g_thread_mmio_registered = mmio_started;
+#endif
 
     guest_cpu_join();
     bridge_run_thread_inline(fn, ctx1, ctx2);
@@ -511,10 +523,16 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (g_thread_mmio_registered && !xbox_PosixMmioUnregisterThread()) abort();
+    g_thread_mmio_registered = 0;
+#endif
     /* The routine returned instead of calling PsTerminateSystemThread; the
      * stack is still ours to give back. */
     xbox_FreeThreadStack(g_thread_stack_top);
     g_thread_stack_top = 0;
+    xbox_HeapFree(g_fs_base);
+    g_fs_base = XBOX_TIB_MAIN;
     pc_thread_role_leave();   /* T1-0 registry */
     return 0;
 }
@@ -523,18 +541,28 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
                                   uint32_t ctx2, uint32_t stack_top,
                                   DWORD *thread_id)
 {
-    struct bridge_thread_start *s = malloc(sizeof(*s));
+    uint32_t tib = xbox_AllocThreadTib();
+    struct bridge_thread_start *s;
     HANDLE th;
 
-    if (!s) return NULL;
-    s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    if (!tib) return NULL;
+    s = malloc(sizeof(*s));
+    if (!s) {
+        xbox_HeapFree(tib);
+        return NULL;
+    }
+    s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2;
+    s->stack_top = stack_top; s->tib = tib;
 
     /* Publish the guest handle and ID before a worker can execute. The caller
      * resumes it only if CreateSuspended was false. Bink initializes its event
      * handles after creating a suspended thread; starting it early races those
      * stores and can leave movie shutdown waiting on a worker forever. */
     th = CreateThread(NULL, 0, bridge_thread_main, s, CREATE_SUSPENDED, thread_id);
-    if (!th) free(s);
+    if (!th) {
+        xbox_HeapFree(tib);
+        free(s);
+    }
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
      * spawn workers too, but never read it back. See kernel_thread.c. */
@@ -565,19 +593,12 @@ static void bridge_PsCreateSystemThreadEx(void)
     uint32_t thread_id_ptr   = STACK_ARG(4);
     uint32_t create_suspended = STACK_ARG(7);
     uint32_t start_routine   = STACK_ARG(9);
-    /* In SPAWN mode there is no privileged "first call": every thread is real,
-     * so the entry can return. In INLINE mode the first call runs the game. */
-    int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
-                        && (g_thread_call_count == 0);
-    g_thread_call_count++;
+    if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr) = 0;
+    if (thread_id_ptr) BRIDGE_MEM32(thread_id_ptr) = 0;
 
-    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
-            g_thread_call_count, start_routine, start_context1, start_context2);
-    fflush(stderr);
-
-    /* Write a fake handle to the output pointer */
-    if (xbox_handle_ptr) {
-        BRIDGE_MEM32(xbox_handle_ptr) = 0xBEEF0001;  /* fake handle */
+    if (!start_routine) {
+        g_eax = STATUS_INVALID_PARAMETER;
+        return;
     }
 
     /* Call the start routine synchronously through the recomp dispatch.
@@ -595,6 +616,14 @@ static void bridge_PsCreateSystemThreadEx(void)
         recomp_func_t fn = recomp_lookup(start_routine);
         if (!fn) fn = recomp_lookup_manual(start_routine);
         if (fn) {
+            LONG call_number = InterlockedIncrement(&g_thread_call_count);
+            int is_first_call = g_thread_mode == XBOX_THREAD_MODE_INLINE &&
+                                call_number == 1;
+            fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%ld: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
+                    (long)call_number, start_routine, start_context1, start_context2);
+            fflush(stderr);
+            if (is_first_call && xbox_handle_ptr)
+                BRIDGE_MEM32(xbox_handle_ptr) = 0xBEEF0001;
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
@@ -632,7 +661,9 @@ static void bridge_PsCreateSystemThreadEx(void)
                     fprintf(stderr, "  [KERNEL] RECOMP_WORKERS=inline: running "
                             "worker 0x%08X on this thread\n", start_routine);
                     fflush(stderr);
+                    if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr) = 0xBEEF0001;
                     bridge_run_thread_inline(fn, start_context1, start_context2);
+                    g_eax = 0;
                     return;
                 }
 
@@ -640,10 +671,11 @@ static void bridge_PsCreateSystemThreadEx(void)
 
                 if (!stack_top) {
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "
-                            "thread stacks, running worker 0x%08X inline\n",
+                            "thread stacks for worker 0x%08X\n",
                             start_routine);
                     fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    g_eax = STATUS_INSUFFICIENT_RESOURCES;
+                    return;
                 } else {
                     DWORD thread_id = 0;
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
@@ -668,6 +700,9 @@ static void bridge_PsCreateSystemThreadEx(void)
         } else {
             fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: start routine 0x%08X not found in dispatch!\n",
                     start_routine);
+            if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr) = 0;
+            g_eax = STATUS_INVALID_PARAMETER;
+            return;
         }
     }
 
@@ -1017,9 +1052,7 @@ static void bridge_NtClose(void)
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE) {
-#ifdef _WIN32
             xbox_dir_context_drop(h);
-#endif
             uint64_t save_started=save_probe_io_begin(h);
             BOOL closed=CloseHandle(h);
             save_probe_io_end(SAVE_PROBE_CLOSE,h,save_started,0,0,
@@ -2300,8 +2333,15 @@ static void bridge_PsTerminateSystemThread(void)
         /* The normal exit for a worker, and therefore the one that has to
          * return the stack -- ExitThread never comes back to bridge_thread_main
          * to do it. */
+#if defined(__aarch64__) && !defined(_WIN32)
+        if (g_thread_mmio_registered && !xbox_PosixMmioUnregisterThread()) abort();
+        g_thread_mmio_registered = 0;
+#endif
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
+        xbox_HeapFree(g_fs_base);
+        g_fs_base = XBOX_TIB_MAIN;
+        guest_cpu_part();
         pc_thread_role_leave();   /* T1-0 registry */
         ExitThread(exit_status);
     }
@@ -2914,6 +2954,10 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static volatile LONG g_timer_started;
 static INIT_ONCE g_timer_once = INIT_ONCE_STATIC_INIT;
+static HANDLE g_timer_thread;
+static HANDLE g_timer_stop;
+static HANDLE g_timer_ready;
+static volatile LONG g_timer_thread_ok;
 
 /* QPC and the coarse fallback have a zero-based origin fixed before the
  * worker starts. Never arm on one clock and expire on another. */
@@ -3039,7 +3083,11 @@ static void kernel_timer_fire_due(long long now)
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
-    HANDLE timer;
+    HANDLE timer = NULL;
+    uint32_t tib = 0;
+#if defined(__aarch64__) && !defined(_WIN32)
+    int mmio_registered = 0;
+#endif
 
     (void)unused;
     pc_thread_role_enter(PC_ROLE_TIMER);   /* T1-0: registry only (no-op policy until T1-5) */
@@ -3047,50 +3095,87 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
                         "timer DPCs will not run\n");
         fflush(stderr);
-        return 0;
+        goto ready;
     }
     g_esp = XBOX_WORKER_STACK_TOP(slot);
-    {
-        /* Its own TIB, for the same reason bridge_thread_main gives one to
-         * every worker: a DPC routine with an SEH prologue reads fs:[0],
-         * and a thread whose g_fs_base is zero faults inside the runtime
-         * before the routine runs. */
-        uint32_t tib = xbox_AllocThreadTib();
-        if (!tib) {
-            fprintf(stderr, "  [KERNEL] timer thread has no TIB; "
-                            "timer DPCs will not run\n");
-            fflush(stderr);
-            return 0;
-        }
-        g_fs_base = tib;
+    /* Its own TIB, for the same reason bridge_thread_main gives one to
+     * every worker: a DPC routine with an SEH prologue reads fs:[0]. */
+    tib = xbox_AllocThreadTib();
+    if (!tib) {
+        fprintf(stderr, "  [KERNEL] timer thread has no TIB; "
+                        "timer DPCs will not run\n");
+        fflush(stderr);
+        goto ready;
     }
+    g_fs_base = tib;
+
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (!xbox_PosixMmioRegisterThread()) {
+        fprintf(stderr, "  [KERNEL] timer thread could not register for MMIO faults\n");
+        fflush(stderr);
+        goto ready;
+    }
+    mmio_registered = 1;
+#endif
 
     /* Allocate only after guest stack/TIB success. A failed wait closes this
-     * exact handle; otherwise the process-lifetime worker owns it until exit. */
+     * exact handle; otherwise this worker owns it until quiesce. */
+#if defined(_WIN32)
     timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002,
                                   TIMER_MODIFY_STATE | SYNCHRONIZE);
+#else
+    timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+#endif
 
-    for (;;) {
+    InterlockedExchange(&g_timer_thread_ok, 1);
+ready:
+    SetEvent(g_timer_ready);
+    while (InterlockedCompareExchange(&g_timer_thread_ok, 0, 0) &&
+           WaitForSingleObject(g_timer_stop, 0) != WAIT_OBJECT_0) {
         kernel_timer_wait(&timer);
+        if (WaitForSingleObject(g_timer_stop, 0) == WAIT_OBJECT_0) break;
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         kernel_timer_fire_due(kernel_timer_now_ms());
     }
+    if (timer) CloseHandle(timer);
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (mmio_registered && !xbox_PosixMmioUnregisterThread()) abort();
+#endif
+    if (tib) {
+        xbox_HeapFree(tib);
+        g_fs_base = XBOX_TIB_MAIN;
+    }
+    if (slot >= 0) xbox_worker_stack_free(slot);
+    pc_thread_role_leave();
+    return 0;
 }
 
 /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */
 static BOOL CALLBACK kernel_timer_init(PINIT_ONCE once, PVOID param, PVOID *context)
 {
-    HANDLE thread;
     (void)once; (void)param; (void)context;
     InitializeCriticalSection(&g_timer_lock);
     kernel_timer_clock_init();
-    thread = CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL);
-    if (!thread) {
+    g_timer_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_timer_ready = CreateEventW(NULL, TRUE, FALSE, NULL);
+    InterlockedExchange(&g_timer_thread_ok, 0);
+    g_timer_thread = g_timer_stop && g_timer_ready ?
+        CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL) : NULL;
+    if (!g_timer_thread ||
+        WaitForSingleObject(g_timer_ready, 5000) != WAIT_OBJECT_0 ||
+        !InterlockedCompareExchange(&g_timer_thread_ok, 0, 0)) {
+        if (g_timer_stop) SetEvent(g_timer_stop);
+        if (g_timer_thread) {
+            (void)WaitForSingleObject(g_timer_thread, 5000);
+            CloseHandle(g_timer_thread);
+        }
+        if (g_timer_ready) CloseHandle(g_timer_ready);
+        if (g_timer_stop) CloseHandle(g_timer_stop);
+        g_timer_thread = g_timer_ready = g_timer_stop = NULL;
         DeleteCriticalSection(&g_timer_lock);
         return FALSE;
     }
-    CloseHandle(thread);
     InterlockedExchange(&g_timer_started, 1);
     return TRUE;
 }
@@ -3107,7 +3192,8 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
      * two dispatch workers lets the same driver's DPC run concurrently, and
      * reinitializing its lock while in use also corrupts the timer table. */
     if (!InitOnceExecuteOnce(&g_timer_once, kernel_timer_init, NULL, NULL)) {
-        fprintf(stderr, "  [KERNEL] unable to start timer dispatcher: %lu\n", GetLastError());
+        fprintf(stderr, "  [KERNEL] unable to start timer dispatcher: %lu\n",
+                (unsigned long)GetLastError());
         g_eax = 0;
         return;
     }
@@ -3646,6 +3732,11 @@ static void bridge_NtOpenFile(void)
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         0, share, 1 /* FILE_OPEN */, options);
+    if (getenv("RECOMP_LOAD_TRACE")) {
+        const char *path = bridge_get_xbox_path(obj_attrs);
+        fprintf(stderr, "  [LOAD-OPEN] path=%s options=%08X status=%08X\n",
+                path ? path : "(null)", options, g_eax);
+    }
 }
 
 /*
@@ -3994,10 +4085,13 @@ static struct { uint32_t ios_va, status, info; ULONGLONG due; } g_xwb_done[XWB_D
 static unsigned g_xwb_done_n;
 static SRWLOCK g_xwb_done_lock = SRWLOCK_INIT;
 static HANDLE g_xwb_done_ev;
+static HANDLE g_xwb_done_thread;
+static volatile LONG g_xwb_done_stop;
+static INIT_ONCE g_xwb_done_once = INIT_ONCE_STATIC_INIT;
 static DWORD WINAPI xwb_done_thread(LPVOID unused)
 {
     (void)unused;
-    for (;;) {
+    while (!InterlockedCompareExchange(&g_xwb_done_stop, 0, 0)) {
         DWORD wait = INFINITE;
         AcquireSRWLockExclusive(&g_xwb_done_lock);
         ULONGLONG now = GetTickCount64();
@@ -4012,18 +4106,28 @@ static DWORD WINAPI xwb_done_thread(LPVOID unused)
         ReleaseSRWLockExclusive(&g_xwb_done_lock);
         WaitForSingleObject(g_xwb_done_ev, wait);
     }
+    return 0;
+}
+static BOOL CALLBACK xwb_done_init(PINIT_ONCE once, PVOID param, PVOID *context)
+{
+    (void)once; (void)param; (void)context;
+    InterlockedExchange(&g_xwb_done_stop, 0);
+    g_xwb_done_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_xwb_done_thread = g_xwb_done_ev ?
+        CreateThread(NULL, 0, xwb_done_thread, NULL, 0, NULL) : NULL;
+    if (!g_xwb_done_thread && g_xwb_done_ev) {
+        CloseHandle(g_xwb_done_ev);
+        g_xwb_done_ev = NULL;
+    }
+    return TRUE;
 }
 /* 1 = queued (the status block reads STATUS_PENDING until then); 0 = full or no thread: complete now */
 static int xwb_defer(uint32_t ios_va, uint32_t status, uint32_t info)
 {
-    static INIT_ONCE once = INIT_ONCE_STATIC_INIT; BOOL pending; int ok = 0;
-    if (InitOnceBeginInitialize(&once, 0, &pending, NULL) && pending) {
-        g_xwb_done_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
-        HANDLE t = g_xwb_done_ev ? CreateThread(NULL, 0, xwb_done_thread, NULL, 0, NULL) : NULL;
-        if (t) CloseHandle(t); else if (g_xwb_done_ev) { CloseHandle(g_xwb_done_ev); g_xwb_done_ev = NULL; }
-        InitOnceComplete(&once, 0, NULL);
-    }
-    if (!g_xwb_done_ev) return 0;
+    int ok = 0;
+    InitOnceExecuteOnce(&g_xwb_done_once, xwb_done_init, NULL, NULL);
+    if (!g_xwb_done_ev || InterlockedCompareExchange(&g_xwb_done_stop, 0, 0))
+        return 0;
     AcquireSRWLockExclusive(&g_xwb_done_lock);
     if (g_xwb_done_n < XWB_DONE_MAX) {
         g_xwb_done[g_xwb_done_n].ios_va = ios_va; g_xwb_done[g_xwb_done_n].status = status; g_xwb_done[g_xwb_done_n].info = info;
@@ -4034,6 +4138,49 @@ static int xwb_defer(uint32_t ios_va, uint32_t status, uint32_t info)
     ReleaseSRWLockExclusive(&g_xwb_done_lock);
     if (ok) SetEvent(g_xwb_done_ev);
     return ok;
+}
+
+static int kernel_timer_quiesce(void)
+{
+    if (!InterlockedCompareExchange(&g_timer_started, 0, 0)) return 1;
+    if (!g_timer_thread || !g_timer_stop || !SetEvent(g_timer_stop) ||
+        WaitForSingleObject(g_timer_thread, 5000) != WAIT_OBJECT_0)
+        return 0;
+    CloseHandle(g_timer_thread);
+    CloseHandle(g_timer_ready);
+    CloseHandle(g_timer_stop);
+    g_timer_thread = g_timer_ready = g_timer_stop = NULL;
+    memset(g_timers, 0, sizeof(g_timers));
+    DeleteCriticalSection(&g_timer_lock);
+    InterlockedExchange64(&g_timer_monotonic_ms, 0);
+    InterlockedExchange(&g_timer_thread_ok, 0);
+    InterlockedExchange(&g_timer_started, 0);
+    g_timer_once.Ptr = NULL;
+    return 1;
+}
+
+static int xwb_done_quiesce(void)
+{
+    if (!g_xwb_done_thread) return 1;
+    InterlockedExchange(&g_xwb_done_stop, 1);
+    if (!g_xwb_done_ev || !SetEvent(g_xwb_done_ev) ||
+        WaitForSingleObject(g_xwb_done_thread, 5000) != WAIT_OBJECT_0)
+        return 0;
+    CloseHandle(g_xwb_done_thread);
+    CloseHandle(g_xwb_done_ev);
+    g_xwb_done_thread = g_xwb_done_ev = NULL;
+    AcquireSRWLockExclusive(&g_xwb_done_lock);
+    g_xwb_done_n = 0;
+    ReleaseSRWLockExclusive(&g_xwb_done_lock);
+    g_xwb_done_once.Ptr = NULL;
+    return 1;
+}
+
+int xbox_kernel_bridge_quiesce(void)
+{
+    int xwb_ok = xwb_done_quiesce();
+    int timer_ok = kernel_timer_quiesce();
+    return xwb_ok && timer_ok;
 }
 
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
@@ -4338,6 +4485,12 @@ static void bridge_NtQueryDirectoryFile(void)
                 XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
                 pfn, (BOOLEAN)restart);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
+    if (getenv("RECOMP_LOAD_TRACE"))
+        fprintf(stderr, "  [LOAD-QUERY] pattern=%.*s class=%u restart=%u "
+                        "status=%08X ios=%08X bytes=%u\n",
+                pfn ? (int)pfn->Length : 0, pfn ? pfn->Buffer : "",
+                info_class, restart, g_eax, (uint32_t)ios.Status,
+                (uint32_t)ios.Information);
 }
 
 /* ── NtOpenSymbolicLinkObject (ordinal 203, 2 args = 8 bytes) */
@@ -8518,20 +8671,25 @@ static void bridge_PsCreateSystemThread(void)
     uint32_t start_context2  = STACK_ARG(5);
     uint32_t start_routine   = STACK_ARG(6);
     uint32_t thread_id_ptr   = STACK_ARG(3);
-    int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
-                        && (g_thread_call_count == 0);
-
-    g_thread_call_count++;
-
-    /* Fake handle until the worker path can write a real one. */
     if (xbox_handle_ptr)
-        BRIDGE_MEM32(xbox_handle_ptr) = 0xBEEF0002;
+        BRIDGE_MEM32(xbox_handle_ptr) = 0;
+    if (thread_id_ptr) BRIDGE_MEM32(thread_id_ptr) = 0;
+
+    if (!start_routine) {
+        g_eax = STATUS_INVALID_PARAMETER;
+        return;
+    }
 
     if (start_routine) {
         recomp_func_t fn = recomp_lookup(start_routine);
         if (!fn)
             fn = recomp_lookup_manual(start_routine);
         if (fn) {
+            LONG call_number = InterlockedIncrement(&g_thread_call_count);
+            int is_first_call = g_thread_mode == XBOX_THREAD_MODE_INLINE &&
+                                call_number == 1;
+            if (is_first_call && xbox_handle_ptr)
+                BRIDGE_MEM32(xbox_handle_ptr) = 0xBEEF0002;
             if (is_first_call) {
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
@@ -8543,13 +8701,15 @@ static void bridge_PsCreateSystemThread(void)
                 uint32_t stack_top;
 
                 if (inline_workers && !strcmp(inline_workers, "inline")) {
+                    if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr) = 0xBEEF0002;
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                     g_eax = 0;
                     return;
                 }
                 stack_top = xbox_AllocThreadStack();
                 if (!stack_top) {
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    g_eax = STATUS_INSUFFICIENT_RESOURCES;
+                    return;
                 } else {
                     DWORD thread_id = 0;
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
@@ -8569,6 +8729,9 @@ static void bridge_PsCreateSystemThread(void)
         } else {
             fprintf(stderr, "  [KERNEL] PsCreateSystemThread: start routine 0x%08X not found in dispatch!\n",
                     start_routine);
+            if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr) = 0;
+            g_eax = STATUS_INVALID_PARAMETER;
+            return;
         }
     }
     g_eax = 0;  /* STATUS_SUCCESS */

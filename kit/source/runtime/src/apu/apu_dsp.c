@@ -16,6 +16,7 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#include "../kernel/xbox_memory_layout.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -63,7 +64,16 @@ void mcpx_apu_dsp_mmio_write(MCPXAPUState *d, uint32_t addr, uint32_t value)
     DSPState *dsp=is_gp ? d->gp.dsp : d->ep.dsp;
     if(offset==NV_PAPU_GPRST && (value&3)!=3)mcpx_apu_dsp_reset_program(dsp);
     if (offset==NV_PAPU_GPRST && (value & 3)==3 && (old & 3)!=3) {
+#if defined(_WIN32)
         uint32_t *mapped=(uint32_t *)(d->ram_ptr+(is_gp ? 0xFE83A000u : 0xFE85A000u));
+#else
+        uint32_t *mapped = xbox_McpxMemoryAlias(is_gp ? 0x3A000u : 0x5A000u,
+                                                0x800u * sizeof(uint32_t));
+        if (!mapped) {
+            fprintf(stderr, "[APU] %s boot DMA has no MCPX alias\n", is_gp ? "GP" : "EP");
+            return;
+        }
+#endif
         if (mcpx_apu_dsp_bootstrap(d,is_gp,mapped)) {
             if (dsp) {
                 memcpy(dsp->core.pram,mapped,0x800*sizeof(uint32_t));

@@ -26,6 +26,9 @@
 #include "../platform/pc_frontend.h"
 #include "../platform/pc_cpu_topo.h"   /* pc_thread_role_enter */
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+#if defined(__aarch64__) && !defined(_WIN32)
+#include "../platform/posix_mmio.h"
+#endif
 #if defined(_WIN32)
 #include <avrt.h>
 #endif
@@ -236,6 +239,17 @@ static void apu_deliver_irq(MCPXAPUState *d)
     if (slot < 0)
         return;
 
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (!xbox_PosixMmioRegisterThread()) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[APU] cannot register IRQ thread for POSIX MMIO\n");
+        }
+        xbox_worker_stack_free(slot);
+        return;
+    }
+#endif
     double ws_t0 = g_apu_ws ? apu_ws_now_ms() : 0.0;     /* [APU-WAIT] isr: time in the guest ISR */
     qemu_mutex_unlock(&d->lock);
     g_esp = XBOX_WORKER_STACK_TOP(slot);
@@ -248,6 +262,9 @@ static void apu_deliver_irq(MCPXAPUState *d)
         fn();
         xbox_InterruptLeave(APU_VECTOR, saved);
     }
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (!xbox_PosixMmioUnregisterThread()) abort();
+#endif
     xbox_worker_stack_free(slot);
     if (g_apu_ws) wt_add(WT_ISR, apu_ws_now_ms() - ws_t0);
     qemu_mutex_lock(&d->lock);
@@ -399,6 +416,8 @@ typedef struct {
 } WaveOutState;
 
 static WaveOutState g_waveout = { 0 };
+static int16_t g_monitor_pending[WAVEOUT_BUF_SAMPLES][2];
+static int g_monitor_filled;
 static int g_output_silent;
 static FILE *g_output_capture;
 static uint32_t g_capture_bytes;
@@ -424,6 +443,7 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.stream = NULL;
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
+    g_monitor_filled = 0;
     const char *silent = getenv("RECOMP_AUDIO_SILENT");
     const char *capture = getenv("RECOMP_AUDIO_CAPTURE");
     g_output_silent = silent && atoi(silent) != 0;
@@ -437,11 +457,19 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
         } else fprintf(stderr, "[AUDIO] Cannot open PCM capture: %s\n", capture);
     }
 
-    /* Try XAudio2 first (lower latency) */
+    /* The host backend receives the already mixed VP/DSP output. */
     if (xa2_init()) {
+#if defined(_WIN32)
         fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
+#else
+        fprintf(stderr, "[APU] Using SDL2 audio backend\n");
+#endif
         return;
     }
+#if !defined(_WIN32)
+    fprintf(stderr, "[APU] SDL2 audio unavailable; output is disabled\n");
+    return;
+#else
     fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
 
     WAVEFORMATEX wfx = { 0 };
@@ -474,11 +502,13 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
     fprintf(stderr, "[APU] waveOut audio output initialized (48kHz stereo 16-bit, %d buffers)\n",
             WAVEOUT_NUM_BUFS);
+#endif
 }
 
 void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 {
     (void)d;
+    g_monitor_filled = 0;
     if (g_output_capture) {
         audio_capture_header();
         fclose(g_output_capture);
@@ -539,8 +569,7 @@ void mcpx_apu_prepare_output_frame(MCPXAPUState *d, int16_t out[256][2])
 
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
-    static int16_t pending[WAVEOUT_BUF_SAMPLES][2];
-    static int filled;
+    int16_t (*pending)[2] = g_monitor_pending;
     int16_t frame[256][2];
     int target;
     if ((d->ep_frame_div + 1) % 8) return;
@@ -557,9 +586,9 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
      * Collect consecutive blocks to keep the original 48 kHz timing. */
     target = xa2_is_active() ? xa2_get_buffer_size() : WAVEOUT_BUF_SAMPLES;
     if (target < 256 || target > WAVEOUT_BUF_SAMPLES || target % 256) return;
-    memcpy(pending + filled, frame, sizeof(frame));
-    filled += 256;
-    if (filled < target) return;
+    memcpy(pending + g_monitor_filled, frame, sizeof(frame));
+    g_monitor_filled += 256;
+    if (g_monitor_filled < target) return;
 
     static int stats=-1;
     if(stats<0)stats=getenv("RECOMP_AUDIO_STATS")!=NULL;
@@ -618,7 +647,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                 Sleep(1);
                 qemu_mutex_lock(&d->lock);
                 if (g_apu_ws) wt_add(WT_BACKPRESSURE, apu_ws_now_ms() - ws_t0);
-                if (qatomic_read(&d->exiting)) { filled = 0; return; }
+                if (qatomic_read(&d->exiting)) { g_monitor_filled = 0; return; }
                 if (GetTickCount() - wait_start >= WAVEOUT_STALL_MS) {
                     wo_stalled = 1; wo_stalls++;
                     fprintf(stderr, "[APU] waveOut stalled %d ms, dropping blocks (stall #%u)\n", WAVEOUT_STALL_MS, wo_stalls);
@@ -628,7 +657,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         }
         if (WAVEOUT_BUSY(hdr)) {
             wo_dropped++;
-            filled = 0;
+            g_monitor_filled = 0;
             return;
         }
         if (wo_stalled) {
@@ -643,7 +672,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
         g_waveout.frames_written++;
     }
-    filled = 0;
+    g_monitor_filled = 0;
 }
 
 /* ============================================================
@@ -754,10 +783,11 @@ static void apu_stats_tick(void)
         LONGLONG us = g_ws[i].us, it = g_ws[i].it;
         LONG maxus = InterlockedExchange(&g_ws[i].maxus, 0);
         len += snprintf(line + len, sizeof(line) - len, "%s %s n=%ld w=%ld %.2f ms max %.2f",
-                        i ? " |" : "", ws_name[i], n - prev[i].n, w - prev[i].w,
+                        i ? " |" : "", ws_name[i], (long)(n - prev[i].n), (long)(w - prev[i].w),
                         (double)(us - prev[i].us) / 1000.0, maxus / 1000.0);
         if (i == WS_DSPCMD) len += snprintf(line + len, sizeof(line) - len, " iters=%lld", it - prev[i].it);
-        len += snprintf(line + len, sizeof(line) - len, " tid=%ld oth=%ld", g_ws[i].last, oth - prev[i].oth);
+        len += snprintf(line + len, sizeof(line) - len, " tid=%ld oth=%ld",
+                        (long)g_ws[i].last, (long)(oth - prev[i].oth));
         prev[i].n = n; prev[i].w = w; prev[i].oth = oth; prev[i].us = us; prev[i].it = it;
     }
     fprintf(stderr, "%s\n", line);
@@ -937,6 +967,25 @@ void mcpx_apu_hold(int hold)
     fflush(stderr);
 }
 
+#if defined(__aarch64__) && !defined(_WIN32)
+int mcpx_apu_quiesce(MCPXAPUState *d)
+{
+    if (!d || d != g_state) return 0;
+    InterlockedExchange(&g_apu_hold, 1);
+    unsigned attempts = 0;
+    while (!TryEnterCriticalSection(&d->lock.cs)) {
+        if (++attempts == 5000) return 0;
+        Sleep(1);
+    }
+    qemu_cond_broadcast(&d->cond);
+    for (unsigned i = 0; !d->is_idle && i < 50; ++i)
+        qemu_cond_timedwait(&d->idle_cond, &d->lock, 100);
+    int idle = d->is_idle;
+    qemu_mutex_unlock(&d->lock);
+    return idle;
+}
+#endif
+
 /* ============================================================
  * Reset
  * ============================================================ */
@@ -963,6 +1012,13 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
 
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 {
+#if !defined(_WIN32)
+    if (ram_ptr && (ram_ptr != xbox_GetMemoryBase() ||
+                    !xbox_McpxMemoryAlias(0x30000u, 0x30000u))) {
+        fprintf(stderr, "[APU] guest RAM and MCPX alias must be initialized first\n");
+        return NULL;
+    }
+#endif
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
     if (!d) {
         fprintf(stderr, "[APU] Failed to allocate MCPXAPUState\n");
@@ -1024,6 +1080,12 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
 {
     if (!d) return;
 
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (xbox_PosixMmioIsBound()) {
+        fprintf(stderr, "[APU] POSIX MMIO remains attached; APU retained\n");
+        return;
+    }
+#endif
     fprintf(stderr, "[APU] Shutting down MCPX APU...\n");
 
     qemu_mutex_lock(&d->lock);
@@ -1033,6 +1095,9 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
     qemu_mutex_unlock(&d->lock);
 
     qemu_thread_join(&d->apu_thread);
+#if defined(__aarch64__) && !defined(_WIN32)
+    InterlockedExchange(&g_apu_hold, 0);
+#endif
     mcpx_apu_vp_finalize(d);
     mcpx_apu_monitor_finalize(d);
     mcpx_apu_dsp_finalize(d);
@@ -1041,6 +1106,15 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
     g_state = NULL;
     fprintf(stderr, "[APU] Shutdown complete\n");
 }
+
+#if defined(__aarch64__) && !defined(_WIN32)
+int mcpx_apu_shutdown_checked(MCPXAPUState *d)
+{
+    if (d && xbox_PosixMmioIsBound()) return 0;
+    mcpx_apu_shutdown(d);
+    return 1;
+}
+#endif
 
 /* ============================================================
  * VP MMIO handlers (sub-region at +0x20000)

@@ -19,10 +19,28 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <intrin.h>
+#include "../platform/host_cpu.h"
 #include "apu_state.h"
 #include "fpconv.h"
 #include <stdarg.h>
+
+#if defined(_MSC_VER)
+#define APU_VP_TLS __declspec(thread)
+#else
+#define APU_VP_TLS __thread
+#define _InterlockedIncrement(p) __atomic_add_fetch((p), 1, __ATOMIC_SEQ_CST)
+#define _InterlockedExchange(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
+#define _InterlockedExchangeAdd64(p, v) __atomic_fetch_add((p), (v), __ATOMIC_SEQ_CST)
+#define _InterlockedOr64(p, v) __atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
+#define _InterlockedAnd64(p, v) __atomic_fetch_and((p), (v), __ATOMIC_SEQ_CST)
+static long apu_vp_compare_exchange(volatile long *p, long value, long expected)
+{
+    __atomic_compare_exchange_n(p, &expected, value, 0,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return expected;
+}
+#define _InterlockedCompareExchange(p, v, c) apu_vp_compare_exchange((p), (v), (c))
+#endif
 
 /* Optional, low-frequency integration telemetry. No per-voice clocks. */
 static int tail_stats_enabled = -1;
@@ -55,7 +73,7 @@ static void tail_stats_end(long long start, unsigned voices)
     DWORD now = GetTickCount();
     if (now - tail_stats_last >= 5000) {
         fprintf(stderr,"[APU-TAIL] tick=%lu frames=%u active-src=%u tail-src=%u filter-only=%u peak-tails=%u starts=%u silent-skips=%u finishes=%u guards=%u avg-us=%.3f max-us=%.3f over667=%u\n",
-            now,tail_stats.frames,tail_stats.active_reads,tail_stats.tail_reads,
+            (unsigned long)now,tail_stats.frames,tail_stats.active_reads,tail_stats.tail_reads,
             tail_stats.filter_visits,tail_stats.peak_voices,tail_stats.starts,
             tail_stats.silent_skips,tail_stats.finishes,tail_stats.guards,
             1e6*tail_stats.ticks/tail_stats_frequency.QuadPart/tail_stats.frames,
@@ -280,7 +298,7 @@ static void voice_trace(MCPXAPUState *d, uint16_t v, const char *event, int line
         voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
         voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_EACUR));
     if (getenv("RECOMP_APU_VOICE_TRACE_RA") && (event[0] == 's' || !strcmp(event, "on"))) {   /* the guest code that asked */
-        extern __declspec(thread) uint32_t g_esp; int n = 0; fprintf(stderr, "[VT-RA] v=%u %s", v, event);
+        extern APU_VP_TLS uint32_t g_esp; int n = 0; fprintf(stderr, "[VT-RA] v=%u %s", v, event);
         for (uint32_t k = 0; k < 200 && n < 10 && g_esp > 0x1000u && g_esp < 0x3F00000u; k++) { uint32_t x = *(uint32_t *)(g_apu_ram_ptr + g_esp + k * 4);
             if (x >= 0x12000u && x < 0x3E9000u) { fprintf(stderr, " %08X", x); n++; } }
         fprintf(stderr, "\n");
@@ -363,13 +381,15 @@ static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
         voice_lock_stat(t0);
         return;
     }
-    if (lock) _InterlockedOr64((volatile __int64 *)&d->vp.voice_locked[v / 64], (__int64)mask);
-    else _InterlockedAnd64((volatile __int64 *)&d->vp.voice_locked[v / 64], (__int64)~mask);
+    if (lock) _InterlockedOr64((volatile int64_t *)&d->vp.voice_locked[v / 64], (int64_t)mask);
+    else _InterlockedAnd64((volatile int64_t *)&d->vp.voice_locked[v / 64], (int64_t)~mask);
     /* Interlocked both sides: the VP stores g_vp_voice then reads the bit, this stores the bit
      * then reads g_vp_voice, so one of them always sees the other. */
-    if (lock && GetCurrentThreadId() != g_vp_thread)
-        for (unsigned spin = 0; _InterlockedCompareExchange(&g_vp_voice, -1, -1) == (long)v; spin++)
-            if (spin < 512) _mm_pause(); else SwitchToThread();
+    if (lock && GetCurrentThreadId() != g_vp_thread) {
+        for (unsigned spin = 0; _InterlockedCompareExchange(&g_vp_voice, -1, -1) == (long)v; spin++) {
+            if (spin < 512) xbox_host_cpu_relax(); else SwitchToThread();
+        }
+    }
     voice_lock_stat(t0);
 }
 
@@ -391,7 +411,7 @@ static void vp_enter(MCPXAPUState *d, uint16_t v)
     if (voice_lock_frame()) return;
     while (is_voice_locked(d, v) && g_vp_wait_budget) {
         _InterlockedExchange(&g_vp_voice, -1);   /* step out so the title's lock can complete */
-        for (int i = 0; i < 16; i++) _mm_pause();
+        for (int i = 0; i < 16; i++) xbox_host_cpu_relax();
         g_vp_wait_budget--;
         _InterlockedExchange(&g_vp_voice, (long)v);
     }
@@ -456,7 +476,7 @@ static volatile LONG mix_trace_busy, mix_trace_done;
 static bool mix_trace(void)
 {
 #if defined(_MSC_VER)
-    static __declspec(thread) int enabled = -1;
+    static APU_VP_TLS int enabled = -1;
 #else
     static __thread int enabled = -1;
 #endif
@@ -724,7 +744,7 @@ fe_dispatch: ;
             if (want == -2) { const char *e = getenv("RECOMP_APU_STACK_BA"); want = e ? strtol(e, NULL, 16) : -1; }
             uint32_t ba = voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CUR_PSL_START, NV_PAVS_VOICE_CUR_PSL_START_BA);
             if (want >= 0 && ba == (uint32_t)want && shown < 40) {
-                extern ptrdiff_t g_xbox_mem_offset; extern __declspec(thread) uint32_t g_esp;
+                extern ptrdiff_t g_xbox_mem_offset; extern APU_VP_TLS uint32_t g_esp;
                 char line[600]; int o = 0; uint32_t sp = g_esp;
                 shown++;
                 o += snprintf(line + o, sizeof line - (size_t)o, "[APU-STACK] ba=%08X esp=%08X:", ba, sp);

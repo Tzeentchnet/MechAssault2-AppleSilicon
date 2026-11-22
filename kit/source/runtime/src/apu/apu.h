@@ -13,13 +13,25 @@ extern "C" {
 
 typedef struct MCPXAPUState MCPXAPUState;
 
+/* Windows publishes this directly. On POSIX, only xbox_PosixMmioAttach/Stop
+ * publish/unpublish it; stop and join every direct reader before Stop. */
+extern MCPXAPUState *g_apu_state;
+
 /* Initialize the APU emulation.
- * ram_ptr: pointer to the base of Xbox physical RAM (64MB).
+ * ram_ptr: pointer to the base of Xbox physical RAM (64MB), or NULL for
+ * unbacked synthetic use. POSIX requires an initialized layout for guest RAM.
  * Returns the APU state, or NULL on failure. */
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 
 /* Shut down and free the APU state. */
 void mcpx_apu_shutdown(MCPXAPUState *d);
+
+#if defined(__aarch64__) && !defined(_WIN32)
+/* Park the frame/IRQ producer without freeing the device, then destroy it
+ * only after the POSIX MMIO broker has stopped and unpublished the state. */
+int mcpx_apu_quiesce(MCPXAPUState *d);
+int mcpx_apu_shutdown_checked(MCPXAPUState *d);
+#endif
 
 /* MMIO read from APU register space (addr is offset from 0xFE800000). */
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);

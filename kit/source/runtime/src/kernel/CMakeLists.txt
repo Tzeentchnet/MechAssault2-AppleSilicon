@@ -25,6 +25,7 @@ set(KERNEL_SOURCES
     recomp_trace.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
+    nv2a_backend.c
     nv2a_pb_objects.c
     nv2a_vsh_interp.c
     nv2a_combiner.c
@@ -62,6 +63,7 @@ if(WIN32)
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt d3d11 dxgi d3dcompiler dxguid)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
+    target_sources(xbox_kernel PRIVATE nv2a_texture_pack_stub.c)
     find_package(OpenSSL REQUIRED)
     target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
 endif()

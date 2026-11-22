@@ -63,7 +63,8 @@ static PcAtomic settings[PC_SETTING_COUNT], bindings[PC_BINDING_COUNT];
 static PcAtomic input_context, input_device, input_revision;
 static PcAtomic pad_buttons, pad_axes[6];
 static PcAtomic menu_buttons[8],camera_capture,text_capture;
-static PcAtomic display_size, render_size, movie_count, movie_skip, cinematic, cinematic_view, cinematic_fps;
+static PcAtomic display_size, render_size, movie_count, movie_skip, safe_start_movie_skip;
+static PcAtomic cinematic, cinematic_view, cinematic_fps;
 void pc_render_size(unsigned width,unsigned height) {
     if(width && height && width<65536 && height<65536)pc_store(&render_size,(int)((width<<16)|height));
 }
@@ -77,6 +78,7 @@ void pc_display_size(unsigned width,unsigned height) {
     if(getenv("RECOMP_DISPLAY_TRACE"))fprintf(stderr,"[PC-DISPLAY] client=%ux%u aspect=%.4f movies=%d\n",width,height,pc_display_aspect(4.f/3.f),pc_load(&movie_count));
 }
 void pc_display_movie(int change) {
+    if(change>0 && pc_load(&movie_count)==0)pc_input_movie_skip_rearm();
     if(change && (change>0 || pc_load(&movie_count)<=1))pc_store(&movie_skip,0);
     if(change>0)pc_increment(&movie_count);
     else if(change<0)pc_store(&movie_count,pc_load(&movie_count)>0?pc_load(&movie_count)-1:0);
@@ -97,7 +99,14 @@ void pc_display_cinematic_config(int view,int fps) {
 static int pc_cinematic_view(void) { int v=pc_load(&cinematic_view);return v?v-1:PC_CINEMATIC_PILLARBOX; }
 static int pc_cinematic_fps(void) { int v=pc_load(&cinematic_fps);return v?v-1:30; }
 void pc_input_movie_skip(void) { if(pc_display_movie_active())pc_store(&movie_skip,1); }
-int pc_input_movie_skip_pending(int ack) { return pc_display_movie_active()?(ack?pc_exchange(&movie_skip,0):pc_load(&movie_skip)):0; }
+void pc_input_movie_skip_rearm(void) { pc_store(&safe_start_movie_skip,0); }
+int pc_input_movie_skip_pending(int ack) {
+    const char *safe=getenv("RECOMP_SAFE_START");
+    if(safe && *safe && !(safe[0]=='0' && safe[1]=='\0'))
+        return ack ? pc_exchange(&safe_start_movie_skip,1)==0 :
+            pc_load(&safe_start_movie_skip)==0;
+    return pc_display_movie_active()?(ack?pc_exchange(&movie_skip,0):pc_load(&movie_skip)):0;
+}
 /* Prerecorded movies keep their own shape without help from here: the game's movie player lays a
  * movie out from the screen size it is given (the widened one, sub_382C0), preserving the movie's
  * aspect -- the 720x480 NTSC intros are true 3:2, the PAL ones 4:3. Forcing 4:3 while a movie

@@ -70,6 +70,10 @@ extern "C" {
 /* Code-page ids accepted by MultiByteToWideChar (only UTF8/ACP are honoured) */
 #define CP_ACP    0u
 #define CP_UTF8   65001u
+#define MB_PRECOMPOSED        0x00000001u
+#define MB_ERR_INVALID_CHARS  0x00000008u
+#define WC_ERR_INVALID_CHARS  0x00000080u
+#define WC_NO_BEST_FIT_CHARS  0x00000400u
 
 /* ---- Callback typedefs ------------------------------------------------- */
 typedef DWORD (WINAPI *LPTHREAD_START_ROUTINE)(LPVOID lpParameter);
@@ -90,12 +94,19 @@ LONG InterlockedDecrement(volatile LONG *Addend);
 LONG InterlockedExchange(volatile LONG *Target, LONG Value);
 LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
+LONGLONG InterlockedIncrement64(volatile LONGLONG *Addend);
+LONGLONG InterlockedAdd64(volatile LONGLONG *Addend, LONGLONG Value);
+LONGLONG InterlockedExchange64(volatile LONGLONG *Target, LONGLONG Value);
+LONGLONG InterlockedExchangeAdd64(volatile LONGLONG *Addend, LONGLONG Value);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
+PVOID InterlockedExchangePointer(PVOID volatile *Dest, PVOID Value);
+#define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 
 /* ---- Critical sections ------------------------------------------------- */
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs);
 VOID InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION cs, DWORD spin);
+BOOL InitializeCriticalSectionEx(LPCRITICAL_SECTION cs, DWORD spin, DWORD flags);
 VOID EnterCriticalSection(LPCRITICAL_SECTION cs);
 VOID LeaveCriticalSection(LPCRITICAL_SECTION cs);
 BOOL TryEnterCriticalSection(LPCRITICAL_SECTION cs);
@@ -219,6 +230,11 @@ BOOL  QueryPerformanceFrequency(PLARGE_INTEGER freq);
 /* ---- Misc ------------------------------------------------------------- */
 VOID  OutputDebugStringA(LPCSTR str);
 VOID  OutputDebugStringW(LPCWSTR str);
+typedef VOID (*WIN32_COMPAT_EXIT_HANDLER)(UINT exitCode, PVOID context);
+/* Installs a handler only for the calling native thread. The handler must not
+ * return; pass NULL to clear it before the thread exits. */
+VOID  Win32CompatSetExitProcessHandler(WIN32_COMPAT_EXIT_HANDLER handler,
+                                       PVOID context);
 VOID  ExitProcess(UINT exitCode);
 BOOL  IsDebuggerPresent(void);
 VOID  DebugBreak(void);
@@ -285,6 +301,8 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
 #define VK_RBUTTON   0x02
 #define VK_CANCEL    0x03
 #define VK_MBUTTON   0x04
+#define VK_XBUTTON1  0x05
+#define VK_XBUTTON2  0x06
 #define VK_BACK      0x08
 #define VK_TAB       0x09
 #define VK_RETURN    0x0D
@@ -305,9 +323,20 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
 #define VK_DOWN      0x28
 #define VK_INSERT    0x2D
 #define VK_DELETE    0x2E
+#define VK_NUMPAD0   0x60
+#define VK_NUMPAD1   0x61
+#define VK_NUMPAD2   0x62
+#define VK_NUMPAD3   0x63
+#define VK_NUMPAD4   0x64
+#define VK_NUMPAD5   0x65
+#define VK_NUMPAD6   0x66
+#define VK_NUMPAD7   0x67
+#define VK_NUMPAD8   0x68
+#define VK_NUMPAD9   0x69
 #define VK_MULTIPLY  0x6A
 #define VK_ADD       0x6B
 #define VK_SUBTRACT  0x6D
+#define VK_DECIMAL   0x6E
 #define VK_DIVIDE    0x6F
 #define VK_F1        0x70
 #define VK_F2        0x71
@@ -315,10 +344,23 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
 #define VK_F4        0x73
 #define VK_F5        0x74
 #define VK_F12       0x7B
+#define VK_LSHIFT    0xA0
+#define VK_RSHIFT    0xA1
+#define VK_LCONTROL  0xA2
+#define VK_RCONTROL  0xA3
+#define VK_LMENU     0xA4
+#define VK_RMENU     0xA5
+#define VK_OEM_1     0xBA
 #define VK_OEM_PLUS  0xBB
 #define VK_OEM_COMMA 0xBC
 #define VK_OEM_MINUS 0xBD
 #define VK_OEM_PERIOD 0xBE
+#define VK_OEM_2     0xBF
+#define VK_OEM_3     0xC0
+#define VK_OEM_4     0xDB
+#define VK_OEM_5     0xDC
+#define VK_OEM_6     0xDD
+#define VK_OEM_7     0xDE
 
 /* ---- Message-loop shims (PeekMessage etc. -- always "no messages") ---- */
 typedef struct tagMSG {
@@ -396,6 +438,7 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_MR_MID_NOT_FOUND        317u
 #define ERROR_INVALID_ADDRESS         487u
 #define ERROR_IO_PENDING              997u
+#define ERROR_NO_UNICODE_TRANSLATION 1113u
 #define ERROR_CANCELLED               1223u
 #define ERROR_NO_SYSTEM_RESOURCES     1450u
 #define ERROR_COMMITMENT_LIMIT        1455u

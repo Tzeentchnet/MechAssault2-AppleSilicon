@@ -24,7 +24,7 @@ if(WIN32)
     add_library(platform STATIC pc_frontend.c)
     target_include_directories(platform PUBLIC ${XBOXRECOMP_SRC_DIR})
 else()
-    add_library(platform STATIC win32_compat.c pc_frontend.c)
+    add_library(platform STATIC win32_compat.c pc_frontend.c posix_mmio.c)
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}

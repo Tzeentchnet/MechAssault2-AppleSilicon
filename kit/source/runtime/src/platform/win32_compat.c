@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <limits.h>
 #include <stdio.h>
 #include <time.h>
 #include <signal.h>
@@ -55,6 +56,11 @@ LONG InterlockedIncrement(volatile LONG *p)        { return __atomic_add_fetch(p
 LONG InterlockedDecrement(volatile LONG *p)        { return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
+LONGLONG InterlockedIncrement64(volatile LONGLONG *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+LONGLONG InterlockedAdd64(volatile LONGLONG *p, LONGLONG v) { return __atomic_add_fetch(p, v, __ATOMIC_SEQ_CST); }
+LONGLONG InterlockedExchange64(volatile LONGLONG *p, LONGLONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
+LONGLONG InterlockedExchangeAdd64(volatile LONGLONG *p, LONGLONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
+PVOID InterlockedExchangePointer(PVOID volatile *p, PVOID v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 
 LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
 {
@@ -78,22 +84,45 @@ PVOID InterlockedCompareExchangePointer(PVOID volatile *p, PVOID xchg, PVOID cmp
 /* Critical sections (recursive pthread mutex)                           */
 /* ===================================================================== */
 
-VOID InitializeCriticalSection(LPCRITICAL_SECTION cs)
+static BOOL cs_initialize(LPCRITICAL_SECTION cs, DWORD spin)
 {
     memset(cs, 0, sizeof(*cs));
     pthread_mutex_t *m = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
     pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(m, &attr);
+    if (!m) return FALSE;
+    if (pthread_mutexattr_init(&attr) != 0) { free(m); return FALSE; }
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0 ||
+        pthread_mutex_init(m, &attr) != 0) {
+        pthread_mutexattr_destroy(&attr);
+        free(m);
+        return FALSE;
+    }
     pthread_mutexattr_destroy(&attr);
     cs->LockSemaphore = m;
+    cs->SpinCount = spin;
+    return TRUE;
+}
+
+VOID InitializeCriticalSection(LPCRITICAL_SECTION cs)
+{
+    if (!cs_initialize(cs, 0)) {
+        fprintf(stderr, "InitializeCriticalSection: host mutex allocation failed\n");
+        abort();
+    }
 }
 
 VOID InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION cs, DWORD spin)
 {
-    InitializeCriticalSection(cs);
-    cs->SpinCount = spin;
+    if (!cs_initialize(cs, spin)) {
+        fprintf(stderr, "InitializeCriticalSectionAndSpinCount: host mutex allocation failed\n");
+        abort();
+    }
+}
+
+BOOL InitializeCriticalSectionEx(LPCRITICAL_SECTION cs, DWORD spin, DWORD flags)
+{
+    (void)flags;
+    return cs_initialize(cs, spin);
 }
 
 VOID EnterCriticalSection(LPCRITICAL_SECTION cs)
@@ -330,6 +359,7 @@ HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
+    if (!o) return NULL;
     o->kind     = kind;
     o->refcount = 1;
     pthread_mutex_init(&o->lock, NULL);
@@ -722,6 +752,10 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 {
     (void)sa;
     w32_object *o = obj_alloc(K_THREAD);
+    if (!o) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     o->start         = start;
     o->start_param   = param;
     o->tid           = (DWORD)InterlockedIncrement(&s_next_tid);
@@ -729,9 +763,20 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
     o->refcount      = 2;   /* one for caller, one for the trampoline */
 
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    if (stackSize)
-        pthread_attr_setstacksize(&attr, stackSize < 65536 ? 65536 : stackSize);
+    if (pthread_attr_init(&attr) != 0) {
+        o->refcount = 1;
+        obj_release(o);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0 ||
+        (stackSize && pthread_attr_setstacksize(&attr, stackSize < 65536 ? 65536 : stackSize) != 0)) {
+        pthread_attr_destroy(&attr);
+        o->refcount = 1;
+        obj_release(o);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
 
     if (pthread_create(&o->thread, &attr, thread_trampoline, o) != 0) {
         pthread_attr_destroy(&attr);
@@ -741,7 +786,7 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
         return NULL;
     }
     pthread_attr_destroy(&attr);
-    o->thread_joinable = 1;
+    o->thread_joinable = 0;
 
     if (threadId) *threadId = o->tid;
     return (HANDLE)o;
@@ -1067,8 +1112,94 @@ static int prot_from_page(DWORD protect)
     case PAGE_EXECUTE:           return PROT_EXEC;
     case PAGE_EXECUTE_READ:      return PROT_READ | PROT_EXEC;
     case PAGE_EXECUTE_READWRITE: return PROT_READ | PROT_WRITE | PROT_EXEC;
-    default:                     return PROT_READ | PROT_WRITE;
+    default:                     return -1;
     }
+}
+
+static size_t w32_host_page_size(void)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    return page > 0 ? (size_t)page : 0;
+}
+
+static int host_page_range(const void *address, size_t size,
+                           uintptr_t *start, size_t *length)
+{
+    size_t page = w32_host_page_size();
+    uintptr_t at = (uintptr_t)address;
+    uintptr_t end;
+    if (!page || !size || at > UINTPTR_MAX - size)
+        return 0;
+    end = at + size;
+    if (end > UINTPTR_MAX - (page - 1))
+        return 0;
+    *start = at - at % page;
+    end = ((end + page - 1) / page) * page;
+    *length = end - *start;
+    return 1;
+}
+
+static DWORD page_from_prot(int prot)
+{
+    if (prot & PROT_EXEC)
+        return prot & PROT_WRITE ? PAGE_EXECUTE_READWRITE :
+               prot & PROT_READ ? PAGE_EXECUTE_READ : PAGE_EXECUTE;
+    return prot & PROT_WRITE ? PAGE_READWRITE :
+           prot & PROT_READ ? PAGE_READONLY : PAGE_NOACCESS;
+}
+
+/* Query the actual host mapping; its end bounds a uniform-protection run. */
+static int host_page_region(const void *address, DWORD *protect, size_t *remaining)
+{
+#if defined(__APPLE__)
+    mach_vm_address_t region = (mach_vm_address_t)(uintptr_t)address;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    kern_return_t result = mach_vm_region(mach_task_self(), &region, &size,
+        VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
+    if (object != MACH_PORT_NULL)
+        mach_port_deallocate(mach_task_self(), object);
+    if (result != KERN_SUCCESS || region > (uintptr_t)address ||
+        (uintptr_t)address - region >= size)
+        return 0;
+    *protect = page_from_prot((info.protection & VM_PROT_READ ? PROT_READ : 0) |
+                              (info.protection & VM_PROT_WRITE ? PROT_WRITE : 0) |
+                              (info.protection & VM_PROT_EXECUTE ? PROT_EXEC : 0));
+    if (remaining) *remaining = (size_t)(size - ((uintptr_t)address - region));
+    return 1;
+#elif defined(__linux__)
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512], perms[5];
+    unsigned long long lo, hi;
+    int found = 0;
+    if (!maps)
+        return 0;
+    while (fgets(line, sizeof(line), maps)) {
+        if (sscanf(line, "%llx-%llx %4s", &lo, &hi, perms) == 3 &&
+            (uintptr_t)address >= lo && (uintptr_t)address < hi) {
+            *protect = page_from_prot((perms[0] == 'r' ? PROT_READ : 0) |
+                                      (perms[1] == 'w' ? PROT_WRITE : 0) |
+                                      (perms[2] == 'x' ? PROT_EXEC : 0));
+            if (remaining) *remaining = (size_t)(hi - (uintptr_t)address);
+            found = 1;
+            break;
+        }
+    }
+    fclose(maps);
+    return found;
+#else
+    (void)address;
+    (void)protect;
+    (void)remaining;
+    return 0;
+#endif
+}
+
+static int host_page_protection(const void *address, DWORD *protect)
+{
+    return host_page_region(address, protect, NULL);
 }
 
 #if defined(__APPLE__)
@@ -1121,21 +1252,66 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
  * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
  * documented to take size 0 -- so the length has to be recoverable here or
  * munmap cannot be called at all. */
-void view_register(void *addr, size_t len);
-size_t view_take(const void *addr);
+static int view_register(void *addr, size_t len);
+static int view_contains(const void *addr, size_t len);
+static int view_release(const void *addr, size_t len);
+
+#if defined(XBOXRECOMP_TEST_FAILURES)
+static int s_test_fail_mappings, s_test_protect_after = -1, s_test_release_after = -1;
+void xbox_TestFailMappings(int on) { __atomic_store_n(&s_test_fail_mappings, on, __ATOMIC_RELAXED); }
+void xbox_TestFailVirtualProtectAfter(int successes)
+{ __atomic_store_n(&s_test_protect_after, successes, __ATOMIC_RELAXED); }
+void xbox_TestFailViewReleaseAfter(int successes)
+{ __atomic_store_n(&s_test_release_after, successes, __ATOMIC_RELAXED); }
+#endif
 
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    size_t page = w32_host_page_size();
+    size_t len;
+
+    if (!page || !size || size > SIZE_MAX - (page - 1) || prot < 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
 
     /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
-     * just adjust protection. */
+     * never change neighbouring guest pages on a larger-page host. */
     if ((allocationType & MEM_COMMIT) && !(allocationType & MEM_RESERVE) && address) {
-        if (mprotect(address, size, prot) == 0)
+        uintptr_t start;
+        if (!host_page_range(address, size, &start, &len) ||
+            !view_contains((const void *)start, len)) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+        if (start != (uintptr_t)address || len != size) {
+            for (size_t offset = 0; offset < len; offset += page) {
+                DWORD current;
+                if (!host_page_protection((const void *)(start + offset), &current) ||
+                    current != protect) {
+                    SetLastError(ERROR_INVALID_PARAMETER);
+                    return NULL;
+                }
+            }
             return address;
-        /* fall through to a fresh mapping */
+        }
+        if (mprotect(address, len, prot) == 0) return address;
+        SetLastError(ERROR_ACCESS_DENIED);
+        return NULL;
     }
+    if (address && (uintptr_t)address % page) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    len = ((size + page - 1) / page) * page;
+    if (!(allocationType & (MEM_COMMIT | MEM_RESERVE))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    if (!(allocationType & MEM_COMMIT))
+        prot = PROT_NONE;
 
 #if defined(MAP_FIXED_NOREPLACE)
     if (address) flags |= MAP_FIXED_NOREPLACE;
@@ -1144,28 +1320,32 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
     void *p;
 #if defined(__APPLE__)
     if (address) {
-        p = mach_map_fixed(address, size, prot ? prot : PROT_READ | PROT_WRITE);
+        p = mach_map_fixed(address, len, prot);
     } else
 #endif
-    p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE, flags, -1, 0);
+    p = mmap(address, len, prot, flags, -1, 0);
     if (p == MAP_FAILED) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
     /* Remember the length: VirtualFree(MEM_RELEASE) is passed size 0 by every
      * Win32 caller, and munmap cannot be called without one. */
-    view_register(p, size);
 #if !defined(MAP_FIXED_NOREPLACE) && !defined(__APPLE__)
     /* Older kernels without MAP_FIXED_NOREPLACE: plain MAP_FIXED would silently
      * unmap whatever already lives there, so we pass the address as a hint and
      * treat a different result as "taken". Apple goes through mach_map_fixed
      * above, which reports that properly instead of inferring it. */
     if (address && p != address) {
-        munmap(p, size);
+        munmap(p, len);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
 #endif
+    if (!view_register(p, len)) {
+        munmap(p, len);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     return p;
 }
 
@@ -1177,20 +1357,62 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
          * TRUE without unmapping -- as this used to -- made every release a
          * silent no-op: the caller believed the address was free, the next
          * allocation there failed, and nothing connected the two. */
-        size_t len = view_take(address);
-        if (size == 0) size = len;
-        if (size == 0) return FALSE;
-        return munmap(address, size) == 0;
+        if (!view_release(address, size)) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return FALSE;
+        }
+        return TRUE;
     }
-    if (freeType & MEM_DECOMMIT)
-        return mprotect(address, size, PROT_NONE) == 0;
-    return TRUE;
+    if (freeType & MEM_DECOMMIT) {
+        DWORD old;
+        return VirtualProtect(address, size, PAGE_NOACCESS, &old);
+    }
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
 }
 
 BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
 {
-    if (oldProtect) *oldProtect = PAGE_READWRITE;
-    return mprotect(address, size, prot_from_page(newProtect)) == 0;
+#if defined(XBOXRECOMP_TEST_FAILURES)
+    int test_after = __atomic_load_n(&s_test_protect_after, __ATOMIC_RELAXED);
+    if (test_after >= 0) {
+        __atomic_store_n(&s_test_protect_after, test_after - 1, __ATOMIC_RELAXED);
+        if (!test_after) { SetLastError(ERROR_ACCESS_DENIED); return FALSE; }
+    }
+#endif
+    uintptr_t start;
+    size_t len;
+    DWORD old;
+    int prot = prot_from_page(newProtect);
+    if (prot < 0 || !host_page_range(address, size, &start, &len) ||
+        !view_contains((const void *)start, len) ||
+        !host_page_protection(address, &old)) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return FALSE;
+    }
+    /* A guest's 4 KB request must not silently change its 12 KB neighbours
+     * on a 16 KB host. Explicit callers can protect an entire host page. */
+    if (start != (uintptr_t)address || len != size) {
+        size_t page = w32_host_page_size();
+        int unchanged = old == newProtect;
+        for (size_t offset = 0; unchanged && offset < len; offset += page) {
+            DWORD current;
+            unchanged = host_page_protection((const void *)(start + offset), &current) &&
+                        current == newProtect;
+        }
+        if (unchanged) {
+            if (oldProtect) *oldProtect = old;
+            return TRUE;
+        }
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (mprotect(address, len, prot) != 0) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    if (oldProtect) *oldProtect = old;
+    return TRUE;
 }
 
 /* ===================================================================== */
@@ -1271,7 +1493,22 @@ VOID OutputDebugStringA(LPCSTR str)
     if (str) fputs(str, stderr);
 }
 
-VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
+static _Thread_local WIN32_COMPAT_EXIT_HANDLER exit_process_handler;
+static _Thread_local PVOID exit_process_context;
+
+VOID Win32CompatSetExitProcessHandler(WIN32_COMPAT_EXIT_HANDLER handler,
+                                      PVOID context)
+{
+    exit_process_context = context;
+    exit_process_handler = handler;
+}
+
+VOID ExitProcess(UINT exitCode)
+{
+    if (exit_process_handler)
+        exit_process_handler(exitCode, exit_process_context);
+    exit((int)exitCode);
+}
 
 BOOL IsDebuggerPresent(void)
 {
@@ -1466,42 +1703,87 @@ VOID OutputDebugStringW(LPCWSTR str)
         fputc((*p < 128) ? (int)*p : '?', stderr);
 }
 
-/*
- * Minimal MultiByteToWideChar / WideCharToMultiByte. Handles UTF-8 and a
- * latin-1 interpretation of CP_ACP -- enough for path/name strings.
- */
+/* CP_ACP remains the existing Latin-1 approximation; UTF-8 uses UTF-16
+ * code units, including surrogate pairs, rather than host wchar_t. */
+static int w32_utf8_continuation(unsigned char c)
+{
+    return (c & 0xc0u) == 0x80u;
+}
+
+static uint32_t w32_decode_utf8(const unsigned char *s, size_t remaining,
+                                size_t *consumed, int *valid)
+{
+    unsigned char a = s[0], b, c, d;
+    *consumed = 1;
+    *valid = 1;
+    if (a < 0x80u) return a;
+    if (remaining >= 2 && a >= 0xc2u && a <= 0xdfu) {
+        b = s[1];
+        if (w32_utf8_continuation(b)) {
+            *consumed = 2;
+            return ((uint32_t)(a & 0x1fu) << 6) | (b & 0x3fu);
+        }
+    } else if (remaining >= 3 && a >= 0xe0u && a <= 0xefu) {
+        b = s[1]; c = s[2];
+        if (w32_utf8_continuation(b) && w32_utf8_continuation(c) &&
+            (a != 0xe0u || b >= 0xa0u) && (a != 0xedu || b < 0xa0u)) {
+            *consumed = 3;
+            return ((uint32_t)(a & 0x0fu) << 12) | ((uint32_t)(b & 0x3fu) << 6) |
+                   (c & 0x3fu);
+        }
+    } else if (remaining >= 4 && a >= 0xf0u && a <= 0xf4u) {
+        b = s[1]; c = s[2]; d = s[3];
+        if (w32_utf8_continuation(b) && w32_utf8_continuation(c) &&
+            w32_utf8_continuation(d) && (a != 0xf0u || b >= 0x90u) &&
+            (a != 0xf4u || b < 0x90u)) {
+            *consumed = 4;
+            return ((uint32_t)(a & 7u) << 18) | ((uint32_t)(b & 0x3fu) << 12) |
+                   ((uint32_t)(c & 0x3fu) << 6) | (d & 0x3fu);
+        }
+    }
+    *valid = 0;
+    return 0xfffdu;
+}
+
 int MultiByteToWideChar(UINT cp, DWORD flags, LPCSTR mb, int mbCount,
                         LPWSTR wide, int wideCount)
 {
-    (void)flags;
-    if (!mb) return 0;
-    int srcLen = (mbCount < 0) ? (int)strlen(mb) + 1 : mbCount;
+    size_t input_size;
     int out = 0;
-
-    for (int i = 0; i < srcLen; ) {
-        unsigned int cpval;
-        unsigned char c = (unsigned char)mb[i];
-
-        if (cp == CP_UTF8 && c >= 0x80) {
-            if ((c & 0xE0) == 0xC0 && i + 1 < srcLen) {
-                cpval = ((c & 0x1F) << 6) | (mb[i+1] & 0x3F); i += 2;
-            } else if ((c & 0xF0) == 0xE0 && i + 2 < srcLen) {
-                cpval = ((c & 0x0F) << 12) | ((mb[i+1] & 0x3F) << 6) |
-                        (mb[i+2] & 0x3F); i += 3;
-            } else if ((c & 0xF8) == 0xF0 && i + 3 < srcLen) {
-                cpval = ((c & 0x07) << 18) | ((mb[i+1] & 0x3F) << 12) |
-                        ((mb[i+2] & 0x3F) << 6) | (mb[i+3] & 0x3F); i += 4;
-            } else { cpval = c; i += 1; }
-        } else {
-            cpval = c; i += 1;   /* ASCII / latin-1 */
+    if (!mb || mbCount == 0 || mbCount < -1 || wideCount < 0 ||
+        (wideCount && !wide) || (cp != CP_UTF8 && cp != CP_ACP) ||
+        (flags & ~(cp == CP_UTF8 ? MB_ERR_INVALID_CHARS :
+                   (MB_ERR_INVALID_CHARS | MB_PRECOMPOSED)))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    input_size = mbCount == -1 ? strlen(mb) + 1u : (size_t)mbCount;
+    for (size_t i = 0; i < input_size;) {
+        size_t used = 1;
+        int valid = 1;
+        uint32_t code = cp == CP_UTF8
+            ? w32_decode_utf8((const unsigned char *)mb + i, input_size - i, &used, &valid)
+            : (unsigned char)mb[i];
+        int units = code > 0xffffu ? 2 : 1;
+        if (!valid && (flags & MB_ERR_INVALID_CHARS)) {
+            SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+            return 0;
         }
-
-        if (cpval > 0xFFFF) cpval = '?';   /* no surrogate pairs */
-        if (wideCount > 0) {
-            if (out >= wideCount) return 0;
-            wide[out] = (WCHAR)cpval;
+        if (out > INT_MAX - units || (wideCount && out > wideCount - units)) {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return 0;
         }
-        out++;
+        if (wideCount) {
+            if (units == 1) {
+                wide[out] = (WCHAR)code;
+            } else {
+                code -= 0x10000u;
+                wide[out] = (WCHAR)(0xd800u + (code >> 10));
+                wide[out + 1] = (WCHAR)(0xdc00u + (code & 0x3ffu));
+            }
+        }
+        out += units;
+        i += used;
     }
     return out;
 }
@@ -1509,32 +1791,61 @@ int MultiByteToWideChar(UINT cp, DWORD flags, LPCSTR mb, int mbCount,
 int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
                         LPSTR mb, int mbCount, LPCSTR defChar, PBOOL usedDef)
 {
-    (void)flags; (void)defChar; (void)usedDef;
-    if (!wide) return 0;
-    int srcLen = wideCount;
-    if (srcLen < 0) { srcLen = 0; while (wide[srcLen]) srcLen++; srcLen++; }
+    size_t input_size;
     int out = 0;
-
-    for (int i = 0; i < srcLen; i++) {
-        unsigned int cpval = wide[i];
-        char buf[4]; int n;
-        if (cp == CP_UTF8 && cpval >= 0x80) {
-            if (cpval < 0x800) {
-                buf[0] = (char)(0xC0 | (cpval >> 6));
-                buf[1] = (char)(0x80 | (cpval & 0x3F)); n = 2;
-            } else {
-                buf[0] = (char)(0xE0 | (cpval >> 12));
-                buf[1] = (char)(0x80 | ((cpval >> 6) & 0x3F));
-                buf[2] = (char)(0x80 | (cpval & 0x3F)); n = 3;
+    if (!wide || wideCount == 0 || wideCount < -1 || mbCount < 0 ||
+        (mbCount && !mb) || (cp != CP_UTF8 && cp != CP_ACP) ||
+        (cp == CP_UTF8 && (defChar || usedDef)) ||
+        (flags & ~(cp == CP_UTF8 ? WC_ERR_INVALID_CHARS : WC_NO_BEST_FIT_CHARS))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (usedDef) *usedDef = FALSE;
+    input_size = wideCount == -1 ? xbox_wcslen(wide) + 1u : (size_t)wideCount;
+    for (size_t i = 0; i < input_size; ++i) {
+        uint32_t code = wide[i];
+        unsigned char bytes[4];
+        int count;
+        if (code >= 0xd800u && code <= 0xdbffu && i + 1 < input_size &&
+            wide[i + 1] >= 0xdc00u && wide[i + 1] <= 0xdfffu) {
+            code = 0x10000u + ((code - 0xd800u) << 10) + (wide[++i] - 0xdc00u);
+        } else if (code >= 0xd800u && code <= 0xdfffu) {
+            if (flags & WC_ERR_INVALID_CHARS) {
+                SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+                return 0;
             }
+            code = 0xfffdu;
+        }
+        if (cp == CP_ACP) {
+            if (code > 0xffu) {
+                bytes[0] = (unsigned char)(defChar ? *defChar : '?');
+                if (usedDef) *usedDef = TRUE;
+            } else {
+                bytes[0] = (unsigned char)code;
+            }
+            count = 1;
+        } else if (code < 0x80u) {
+            bytes[0] = (unsigned char)code; count = 1;
+        } else if (code < 0x800u) {
+            bytes[0] = (unsigned char)(0xc0u | (code >> 6));
+            bytes[1] = (unsigned char)(0x80u | (code & 0x3fu)); count = 2;
+        } else if (code < 0x10000u) {
+            bytes[0] = (unsigned char)(0xe0u | (code >> 12));
+            bytes[1] = (unsigned char)(0x80u | ((code >> 6) & 0x3fu));
+            bytes[2] = (unsigned char)(0x80u | (code & 0x3fu)); count = 3;
         } else {
-            buf[0] = (char)(cpval > 0xFF ? '?' : cpval); n = 1;
+            bytes[0] = (unsigned char)(0xf0u | (code >> 18));
+            bytes[1] = (unsigned char)(0x80u | ((code >> 12) & 0x3fu));
+            bytes[2] = (unsigned char)(0x80u | ((code >> 6) & 0x3fu));
+            bytes[3] = (unsigned char)(0x80u | (code & 0x3fu)); count = 4;
         }
-        if (mbCount > 0) {
-            if (out + n > mbCount) return 0;
-            for (int k = 0; k < n; k++) mb[out + k] = buf[k];
+        if (out > INT_MAX - count || (mbCount && out > mbCount - count)) {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return 0;
         }
-        out += n;
+        if (mbCount)
+            memcpy(mb + out, bytes, (size_t)count);
+        out += count;
     }
     return out;
 }
@@ -1549,12 +1860,19 @@ typedef struct { void *addr; size_t len; } w32_view;
 static w32_view        s_views[512];
 static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
 
-void view_register(void *addr, size_t len)
+static int view_register(void *addr, size_t len)
 {
+    int registered = 0;
     pthread_mutex_lock(&s_views_lock);
     for (int i = 0; i < 512; i++)
-        if (!s_views[i].addr) { s_views[i].addr = addr; s_views[i].len = len; break; }
+        if (!s_views[i].addr) {
+            s_views[i].addr = addr;
+            s_views[i].len = len;
+            registered = 1;
+            break;
+        }
     pthread_mutex_unlock(&s_views_lock);
+    return registered;
 }
 
 /* Non-destructive counterpart to view_take, and interior-aware: VirtualQuery
@@ -1581,14 +1899,94 @@ int view_lookup(const void *addr, void **base_out, size_t *len_out)
     return found;
 }
 
-size_t view_take(const void *addr)
+static uintptr_t view_next_above(const void *addr)
 {
-    size_t len = 0;
+    uintptr_t at = (uintptr_t)addr, next = 0;
     pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 512; i++)
-        if (s_views[i].addr == addr) { len = s_views[i].len; s_views[i].addr = NULL; break; }
+    for (int i = 0; i < 512; ++i) {
+        uintptr_t candidate = (uintptr_t)s_views[i].addr;
+        if (candidate > at && (!next || candidate < next)) next = candidate;
+    }
     pthread_mutex_unlock(&s_views_lock);
-    return len;
+    return next;
+}
+
+static int view_contains(const void *addr, size_t len)
+{
+    uintptr_t at = (uintptr_t)addr;
+    int found = 0;
+    if (!len || at > UINTPTR_MAX - len)
+        return 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        uintptr_t lo = (uintptr_t)s_views[i].addr;
+        if (lo && at >= lo && at - lo <= s_views[i].len &&
+            len <= s_views[i].len - (at - lo)) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return found;
+}
+
+/* Preserve the rest of a reservation when the guest layout carves a slice. */
+static int view_release(const void *addr, size_t len)
+{
+#if defined(XBOXRECOMP_TEST_FAILURES)
+    int test_after = __atomic_load_n(&s_test_release_after, __ATOMIC_RELAXED);
+    if (test_after >= 0) {
+        __atomic_store_n(&s_test_release_after, test_after - 1, __ATOMIC_RELAXED);
+        if (!test_after) return 0;
+    }
+#endif
+    uintptr_t at = (uintptr_t)addr;
+    size_t page = w32_host_page_size();
+    int result = 0;
+    if (!at || !page || at % page || (len && len % page))
+        return 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        uintptr_t lo = (uintptr_t)s_views[i].addr;
+        size_t before, after;
+        int extra = -1;
+        if (!lo || at < lo || at - lo >= s_views[i].len)
+            continue;
+        if (!len) {
+            if (at != lo)
+                break;
+            len = s_views[i].len;
+        }
+        before = at - lo;
+        if (len > s_views[i].len - before)
+            break;
+        after = s_views[i].len - before - len;
+        if (before && after) {
+            for (int j = 0; j < 512; j++)
+                if (!s_views[j].addr) { extra = j; break; }
+            if (extra < 0)
+                break;
+        }
+        if (munmap((void *)at, len) != 0)
+            break;
+        if (before) {
+            s_views[i].len = before;
+            if (after) {
+                s_views[extra].addr = (void *)(at + len);
+                s_views[extra].len = after;
+            }
+        } else if (after) {
+            s_views[i].addr = (void *)(at + len);
+            s_views[i].len = after;
+        } else {
+            s_views[i].addr = NULL;
+            s_views[i].len = 0;
+        }
+        result = 1;
+        break;
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return result;
 }
 
 /* An unnamed file descriptor that ftruncate and mmap both accept. Linux has
@@ -1599,8 +1997,9 @@ static int anon_map_fd(const char *name)
     static volatile LONG map_counter = 0;
     char shm_name[32];
     LONG seq = InterlockedIncrement(&map_counter);
-    const char *base = name ? name : "xbox_map";
-    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, seq);
+    (void)name;
+    snprintf(shm_name, sizeof(shm_name), "/x%lx_%lx",
+             (unsigned long)getpid(), (unsigned long)seq);
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
@@ -1625,6 +2024,11 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     }
 
     w32_object *o = obj_alloc(K_FILEMAP);
+    if (!o) {
+        close(fd);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     o->fd       = fd;
     o->map_size = size;
     return (HANDLE)o;
@@ -1640,13 +2044,37 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
 LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
                        SIZE_T count, LPVOID baseAddr)
 {
+#if defined(XBOXRECOMP_TEST_FAILURES)
+    if (__atomic_load_n(&s_test_fail_mappings, __ATOMIC_RELAXED)) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+#endif
     w32_object *o = (w32_object *)mapping;
     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
 
-    off_t  off = ((off_t)offHigh << 32) | offLow;
-    SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
+    uint64_t offset = ((uint64_t)offHigh << 32) | offLow;
+    SIZE_T len;
+    SIZE_T mapped_len;
+    size_t page = w32_host_page_size();
+    off_t off;
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
     int flags  = MAP_SHARED;
+    int placeholder = 0;
+
+    if (!page || offset > o->map_size || offset > INT64_MAX ||
+        offset % page || (baseAddr && (uintptr_t)baseAddr % page)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    len = count ? count : o->map_size - (SIZE_T)offset;
+    if (!len || len > o->map_size - (SIZE_T)offset ||
+        len > SIZE_MAX - (page - 1)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    mapped_len = ((len + page - 1) / page) * page;
+    off = (off_t)offset;
 
     /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
      * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
@@ -1661,26 +2089,34 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
         /* Darwin has no MAP_FIXED_NOREPLACE. Claim the range first with
          * mach_vm_map(VM_FLAGS_FIXED), which refuses rather than displaces;
          * MAP_FIXED below can then only replace the placeholder we now own. */
-        if (mach_map_fixed(baseAddr, len, PROT_READ | PROT_WRITE) == MAP_FAILED) {
+        if (mach_map_fixed(baseAddr, mapped_len, PROT_READ | PROT_WRITE) == MAP_FAILED) {
             SetLastError(ERROR_INVALID_ADDRESS);
             return NULL;
         }
-        flags |= MAP_FIXED;
-#else
+        placeholder = 1;
         flags |= MAP_FIXED;
 #endif
     }
 
-    void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
-    if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    void *p = mmap(baseAddr, mapped_len, prot, flags, o->fd, off);
+    if (p == MAP_FAILED) {
+        if (placeholder)
+            munmap(baseAddr, mapped_len);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     if (baseAddr && p != baseAddr) {
         /* MAP_FIXED_NOREPLACE hands back a different address instead of
          * failing on some kernels; treat that as the refusal it means. */
-        munmap(p, len);
+        munmap(p, mapped_len);
         SetLastError(ERROR_INVALID_ADDRESS);
         return NULL;
     }
-    view_register(p, len);
+    if (!view_register(p, mapped_len)) {
+        munmap(p, mapped_len);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     return p;
 }
 
@@ -1691,9 +2127,11 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, 
 
 BOOL UnmapViewOfFile(LPCVOID baseAddr)
 {
-    size_t len = view_take(baseAddr);
-    if (len == 0) return FALSE;
-    return munmap((void *)baseAddr, len) == 0;
+    if (!view_release(baseAddr, 0)) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 /* ===================================================================== */
@@ -1728,10 +2166,14 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
     size_t len  = 0;
 
     if (!view_lookup(address, &base, &len)) {
-        /* Not ours. Report it free rather than inventing a committed page. */
+        /* Only shim-owned mappings are visible here; a fixed reservation can
+         * still fail on an unrelated host mapping. Free runs must advance. */
+        uintptr_t at = (uintptr_t)address;
+        uintptr_t next = view_next_above(address);
         buffer->BaseAddress    = (PVOID)address;
         buffer->AllocationBase = NULL;
-        buffer->RegionSize     = 0;
+        buffer->RegionSize     = next ? next - at :
+                                 at ? UINTPTR_MAX - at + 1 : UINTPTR_MAX;
         buffer->State          = MEM_FREE;
         buffer->Protect        = PAGE_NOACCESS;
         buffer->Type           = 0;
@@ -1740,12 +2182,16 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
 
     buffer->BaseAddress      = (PVOID)address;
     buffer->AllocationBase   = base;
-    buffer->AllocationProtect = PAGE_READWRITE;
+    size_t host_remaining;
+    if (!host_page_region(address, &buffer->Protect, &host_remaining))
+        return 0;
+    buffer->AllocationProtect = buffer->Protect;
     /* From the queried address to the end of the region, which is what Win32
      * reports and what callers sizing a copy out of it depend on. */
     buffer->RegionSize       = len - (size_t)((uintptr_t)address - (uintptr_t)base);
+    if (buffer->RegionSize > host_remaining)
+        buffer->RegionSize = host_remaining;
     buffer->State            = MEM_COMMIT;
-    buffer->Protect          = PAGE_READWRITE;
     buffer->Type             = MEM_PRIVATE;
     return sizeof(*buffer);
 }

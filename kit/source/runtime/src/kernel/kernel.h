@@ -528,6 +528,9 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
+/* Stop and join bridge-owned workers that can execute generated code or touch
+ * guest memory. Call before sealing POSIX MMIO producers. */
+int xbox_kernel_bridge_quiesce(void);
 
 /**
  * Per-title kernel ordinal remap.
@@ -577,9 +580,7 @@ const wchar_t *xbox_LastHostPath(void);
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 /* Read the exact host path of an open guest file token without consuming it. */
 BOOL xbox_bridge_file_path(uint32_t token,xbox_host_char *path,DWORD capacity);
-#if defined(_WIN32)
 BOOL xbox_path_is_partition_device(const char* xbox_path);
-#endif
 
 /* Optional: a project sets this to see the guest paths the kernel translates
  * (for example to print who opened a file). NULL by default; called before the
@@ -694,9 +695,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     PLARGE_INTEGER ByteOffset);
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
-#ifdef _WIN32
 void xbox_dir_context_drop(HANDLE FileHandle);
-#endif
 
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
 

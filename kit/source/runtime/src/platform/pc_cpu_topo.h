@@ -20,7 +20,11 @@
  * Include as "platform/pc_cpu_topo.h" from src\*.c, "../platform/pc_cpu_topo.h" from src\kernel and
  * src\apu (those land in the kit's runtime tree). */
 #pragma once
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -115,7 +119,11 @@ typedef struct PcCpuTopoApi {
     void (*role_leave)(void);
     void (*cpu_note)(void);    /* T1-0 TH-1: set only while RECOMP_PERF_CPU=1 reports run */
 } PcCpuTopoApi;
+#if defined(_MSC_VER)
 __declspec(selectany) PcCpuTopoApi pc_cpu_topo_api = { 0, 0, 0, 0 };
+#else
+__attribute__((weak)) PcCpuTopoApi pc_cpu_topo_api = { 0, 0, 0, 0 };
+#endif
 
 /* The startup topology, or NULL (lib-only tests, or before main.c's init). */
 static __inline const PcCpuTopo *pc_cpu_topo(void) { return pc_cpu_topo_api.topo; }
@@ -124,6 +132,7 @@ static __inline const PcCpuTopo *pc_cpu_topo(void) { return pc_cpu_topo_api.topo
 static __inline unsigned pc_cpu_logical(void)
 {
     const PcCpuTopo *t = pc_cpu_topo_api.topo;
+#if defined(_WIN32)
     DWORD_PTR process = 0, system = 0;
     unsigned n = 0;
     if (t) return t->logical;
@@ -132,6 +141,12 @@ static __inline unsigned pc_cpu_logical(void)
     else
         n = (unsigned)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     return n ? n : 1;
+#else
+    long n;
+    if (t) return t->logical;
+    n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (unsigned)n : 1;
+#endif
 }
 
 static __inline int pc_cpu_tier(void)
@@ -144,9 +159,13 @@ static __inline int pc_cpu_tier(void)
 /* Live power source (the topology holds the startup snapshot): PC_POWER_*. */
 static __inline int pc_power_source(void)
 {
+#if defined(_WIN32)
     SYSTEM_POWER_STATUS ps;
     if (!GetSystemPowerStatus(&ps)) return PC_POWER_UNKNOWN;
     return ps.ACLineStatus == 0 ? PC_POWER_BATTERY : ps.ACLineStatus == 1 ? PC_POWER_AC : PC_POWER_UNKNOWN;
+#else
+    return PC_POWER_UNKNOWN;
+#endif
 }
 
 /* Register the calling thread under a role (PcThreadRole). Call once near the top of the thread;

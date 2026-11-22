@@ -41,7 +41,7 @@ run again with the same folders. Running it again on a finished install adds opt
   Paths may be relative to the folder you run it from, and may be quoted.
   (from cmd.exe use: start /wait "" "MechAssault 2 Recomp Installer.exe" ...)
 """
-import argparse, ctypes, hashlib, json, os, re, shutil, subprocess, sys, threading, time
+import argparse, ctypes, hashlib, json, os, re, shutil, signal, struct, subprocess, sys, threading, time, zlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent            # installer/
@@ -191,6 +191,7 @@ class Stop(Exception):
 # Optional content: its failure never undoes or invalidates the game install.
 OPTIONAL_STEPS = ('textures-2x', 'textures-4x', 'videos')
 OPTIONAL_NAMES = {'textures-2x': 'The 2x enhanced textures', 'textures-4x': 'The 4x enhanced textures', 'videos': 'The enhanced cutscene videos'}
+GENERATION_STEPS = ('check', 'analyze', 'recompile', 'generate', 'patch')
 NO_CONSOLE = getattr(subprocess, 'CREATE_NO_WINDOW', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)   # no window to close, no shared Ctrl+C
 
 ENHANCER_HINT = ('Antivirus software may be blocking Python, which makes the enhanced content: allow the install folder in it, then try again. '
@@ -1042,6 +1043,7 @@ class Installer:
         self.opts = {'textures': sorted(set(textures)), 'videos': bool(videos)}
         self.jobs, self.keep_work, self.allow_cpu = jobs, keep_work, allow_cpu
         self.until = None                         # maintainers: stop after this step (--until)
+        self.pc_assets_only = False
         self.install_build_tools, self.vs_choice = install_build_tools, vs
         self.log, self.on_step = log, step
         self.proc = None; self.cancelled = False
@@ -1052,6 +1054,10 @@ class Installer:
         self.cancelled = True
         p = self.proc
         if p and p.poll() is None:
+            if os.name != 'nt':
+                try: os.killpg(p.pid, signal.SIGTERM)
+                except ProcessLookupError: pass
+                return
             try:
                 if getattr(p, 'in_job', False) and tool_job() and tool_job().terminate():
                     return                             # the whole tree ends at once (only one tool runs at a time)
@@ -1082,10 +1088,11 @@ class Installer:
         no shared Ctrl+C (its own process group). `hint` is added to the failure message when the tool was stopped from outside."""
         if self.cancelled: raise Stop('Cancelled.', 'cancelled')
         if title: self.log('> ' + title)
-        flags = NO_CONSOLE | (BELOW_NORMAL if self.low_priority else 0)
+        flags = (NO_CONSOLE | (BELOW_NORMAL if self.low_priority else 0)) if os.name == 'nt' else 0
         kw = dict(cwd=str(cwd) if cwd else None, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                   creationflags=flags)
-        job = tool_job()
+        if os.name != 'nt': kw['start_new_session'] = True
+        job = tool_job() if os.name == 'nt' else None
         self.proc = None
         if job:                                    # in the job: Cancel and the installer's exit end the whole tree
             try:
@@ -1246,6 +1253,8 @@ class Installer:
         return not (self.state.get('update') and self.game_ok)
 
     def steps(self):
+        if self.pc_assets_only and sys.platform != 'win32':
+            return [('check', 'Checking requirements', self.check), ('assets', 'Building the PC menus', self.assets)]
         core = [('check', 'Checking requirements', self.check)]
         if not self.game_installed():                 # a Resume after the game was made final runs only the optional steps
             if self.state.get('update') and self.game_ok:
@@ -1271,6 +1280,15 @@ class Installer:
     def step_names(self):
         return [name for name, _, _ in self.steps()]
 
+    def disc_validation_only(self):
+        return sys.platform != 'win32' and self.until in ('disc', 'extract')
+
+    def generation_only(self):
+        return sys.platform != 'win32' and (self.until in GENERATION_STEPS or self.pc_assets_only)
+
+    def portable_staged_run(self):
+        return self.disc_validation_only() or self.generation_only()
+
     def run(self):
         self._start_logs()
         try:
@@ -1286,10 +1304,11 @@ class Installer:
         try: self.log('  session %s' % precheck.session_id())          # the same id is in the stub's and the window's logs
         except Exception: pass
         self.old_stamp = precheck.read_stamp(self.dest)
-        try:
-            for f in clean_stale_build_folders(build_bases(self.work.anchor)): self.log('  removed an old build folder: %s' % f)
-        except Exception as e:
-            self.log('  (old build folders were not checked: %s)' % e)
+        if sys.platform == 'win32':
+            try:
+                for f in clean_stale_build_folders(build_bases(self.work.anchor)): self.log('  removed an old build folder: %s' % f)
+            except Exception as e:
+                self.log('  (old build folders were not checked: %s)' % e)
         if state_file.is_file():
             try:
                 self.state = json.loads(state_file.read_text(encoding='utf-8'))
@@ -1330,7 +1349,7 @@ class Installer:
         self.logfile = open(self.work / 'install.log', 'a', encoding='utf-8')
         self.state['options'] = self.opts
         self.save()
-        self.remember_install()
+        if sys.platform == 'win32': self.remember_install()
         try:
             self.run_steps()
         except BaseException as e:
@@ -1383,7 +1402,11 @@ class Installer:
                 skipped = (name in self.state['done'] and name not in ('check', 'finish')) or not self.wanted(name)
                 self.on_step(index, len(steps), title, name, skipped)
                 if skipped:
-                    self.log('[%d/%d] %s: already done' % (index, len(steps), title)); continue
+                    self.log('[%d/%d] %s: already done' % (index, len(steps), title))
+                    if self.portable_staged_run() and name == self.until:
+                        self.save()
+                        self.log('Stopped after "%s" as requested (--until); the work folder is %s.' % (name, self.work)); return
+                    continue
                 self.log('[%d/%d] %s' % (index, len(steps), title))
                 t0 = time.monotonic(); fn()
                 self.log('    done in %s' % duration(time.monotonic() - t0))
@@ -1410,16 +1433,175 @@ class Installer:
                 if name in outputs and not outputs[name]().exists(): stale.append(name)
             except (OSError, Stop):
                 pass
+        if self.generation_only():
+            invalid = ()
+            if 'extract' in done and not self.game_files_ok():
+                invalid = ('extract', 'analyze', 'recompile', 'generate', 'patch', 'assets')
+            elif 'analyze' in done and not self.analysis_outputs_exist():
+                invalid = ('analyze', 'recompile', 'generate', 'patch', 'assets')
+            elif not self.state.get('patch_started'):
+                stage = next((n for n in ('patch', 'generate', 'recompile') if n in done), None)
+                if stage and not self.generation_outputs_valid(stage):
+                    invalid = ('recompile', 'generate', 'patch', 'assets')
+            stale.extend(n for n in done if n in invalid and n not in stale)
+            if 'assets' in done and 'assets' not in stale and not self.asset_outputs_valid():
+                stale.append('assets')
         if stale:
             self.state['done'] = [n for n in done if n not in stale]; self.save()
-            for n in stale: self.log('  "%s" was marked done, but its result is missing; it runs again' % n)
+            for n in stale:
+                reason = 'missing or changed' if self.generation_only() else 'missing'
+                self.log('  "%s" was marked done, but its result is %s; it runs again' % (n, reason))
         return stale
+
+    def analysis_outputs_exist(self):
+        tk = self.work / 'toolkit'
+        return self.game_files_ok() and all(p.is_file() for p in (
+            tk / 'tools' / 'disasm' / 'output' / 'functions.json',
+            tk / 'tools' / 'disasm' / 'output' / 'labels.json',
+            tk / 'tools' / 'func_id' / 'output' / 'identified_functions.json',
+            tk / 'tools' / 'abi_analysis' / 'output' / 'abi_functions.json'))
+
+    def asset_outputs_valid(self):
+        try:
+            import pc_assets
+            pc_assets.verify_existing(self.dest)
+            for name in ('shader-seed.pack', 'shader-levels.txt'):
+                src, dst = KIT / 'assets' / name, self.dest / 'pc_assets' / name
+                if src.is_file() and (not dst.is_file() or sha256(src) != sha256(dst)): return False
+            return True
+        except (OSError, ValueError, KeyError, IndexError, StopIteration,
+                struct.error, zlib.error, SystemExit):
+            return False
+
+    def generation_manifests(self, stage):
+        import gen_patch
+        patches = KIT / 'patches'
+        def hashes(value):
+            return (isinstance(value, dict) and bool(value) and
+                    all(isinstance(n, str) and n and isinstance(h, str) and re.fullmatch(r'[0-9a-f]{64}', h)
+                        for n, h in value.items()))
+        def edits(manifest):
+            if not isinstance(manifest, dict) or manifest.get('format') not in gen_patch.FORMATS:
+                raise ValueError('invalid edit manifest')
+            base, final = manifest['base'], manifest['final']
+            if not hashes(base) or not hashes(final): raise ValueError('invalid hash map')
+            lists = [manifest['patched'], manifest['added'], manifest.get('removed', [])]
+            if any(not isinstance(v, list) or any(not isinstance(n, str) for n in v) or len(set(v)) != len(v) for v in lists):
+                raise ValueError('invalid edit lists')
+            patched, added, removed = (set(v) for v in lists)
+            before, after = set(base), set(final)
+            changed = {n for n in before & after if base[n] != final[n]}
+            if patched != changed or added != after - before or removed != before - after:
+                raise ValueError('inconsistent edit manifest')
+        try:
+            main = json.loads((patches / 'manifest.json').read_text(encoding='utf-8'))
+            edits(main)
+            spec = post = None
+            if stage == 'patch':
+                fc = patches / 'fastcode'
+                spec = json.loads((fc / 'fastcode.json').read_text(encoding='utf-8'))
+                if (not isinstance(spec, dict) or not isinstance(spec['lf'], list) or not spec['lf']
+                        or any(not isinstance(n, str) for n in spec['lf']) or not hashes(spec['final'])
+                        or not isinstance(spec['whole'], list) or any(not isinstance(n, str) for n in spec['whole'])
+                        or not isinstance(spec['hot'], str) or not spec['hot']
+                        or not isinstance(spec.get('force', []), list)
+                        or any(not isinstance(n, str) for n in spec.get('force', []))):
+                    raise ValueError('invalid FastCode manifest')
+                if spec.get('post'):
+                    post = json.loads((fc / spec['post'] / 'manifest.json').read_text(encoding='utf-8'))
+                    edits(post)
+        except (OSError, ValueError, TypeError, KeyError):
+            raise Stop('The shipped generation manifests are missing, invalid or inconsistent; generation cannot be verified.')
+        return main, spec, post
+
+    def generation_outputs_valid(self, stage):
+        """Check completed private stages against the shipped manifests before skipping them."""
+        gen = self.project() / 'src' / 'recomp' / 'gen'
+        main, spec, post = self.generation_manifests(stage)
+        base, final = main['base'], main['final']
+
+        def matches(name, expected, undo_lf=False):
+            try:
+                path = gen / name
+                if not path.is_file(): return False
+                if not undo_lf: return sha256(path) == expected
+                data = path.read_bytes()
+                return b'\r' not in data and hashlib.sha256(data.replace(b'\n', b'\r\n')).hexdigest() == expected
+            except OSError:
+                return False
+
+        if stage != 'patch':
+            return all(matches(n, h) for n, h in base.items()
+                       if stage != 'recompile' or not (n.startswith('recomp_bringup') or n == 'recomp_fastpaths.c'))
+        fast_final, lf = spec['final'], set(spec['lf'])
+        post_removed = set(post.get('removed', [])) if post else set()
+        for n in lf:
+            try:
+                if b'\r' in (gen / n).read_bytes(): return False
+            except OSError:
+                return False
+        if not all(matches(n, h, n in lf) for n, h in final.items() if n not in fast_final and n not in post_removed):
+            return False
+        if not all(matches(n, h) for n, h in fast_final.items()): return False
+        if post and not all(matches(n, h) for n, h in post['final'].items()): return False
+        removed = (set(main.get('removed', [])) | post_removed) - set(fast_final) - set(post['final'] if post else ())
+        return all(not (gen / n).exists() for n in removed)
+
+    def checked_disc_manifest(self):
+        try:
+            manifest = json.loads((HERE / 'data' / 'disc-manifest.json').read_text(encoding='utf-8'))
+            if not isinstance(manifest, dict) or not manifest or any(
+                    not isinstance(v, list) or len(v) != 2 or type(v[0]) is not int or v[0] < 0
+                    or not isinstance(v[1], str) or not re.fullmatch(r'[0-9a-f]{64}', v[1])
+                    for v in manifest.values()):
+                raise ValueError('invalid manifest')
+            if manifest.get(RELEASE['xbe']) != [RELEASE['xbe_bytes'], RELEASE['xbe_sha256']]:
+                raise ValueError('manifest executable mismatch')
+        except (OSError, ValueError, KeyError, TypeError):
+            raise Stop('The supported disc manifest is missing or invalid; full disc validation cannot run.', 'disc')
+        return manifest
+
+    def check_extraction_space(self, manifest):
+        try:
+            free = shutil.disk_usage(self.dest).free
+        except OSError:
+            raise Stop('Cannot determine free space for disc extraction.', 'access_denied')
+        if free < sum(v[0] for v in manifest.values()):
+            raise Stop('Not enough free space to extract the supported disc files.', 'disk_full')
 
     def check(self):
         if sys.version_info < (3, 10) or sys.maxsize < 2 ** 32:
             raise Stop('The installer needs 64-bit Python 3.10 or newer.', 'compiler')   # only when run outside the exe
+        if self.pc_assets_only and sys.platform == 'win32':
+            raise Stop('--pc-assets-only is for non-Windows generation; use the normal Windows install.', 'compiler')
+        if sys.platform != 'win32' and not self.portable_staged_run():
+            raise Stop('The build, install and package stages are not supported on this platform. '
+                       'Use --until patch for generation, or --pc-assets-only for checked PC assets.', 'compiler')
+        if self.pc_assets_only and not {'extract', 'patch'}.issubset(self.state.get('done', [])):
+            raise Stop('PC assets require a completed extraction and generation through --until patch in this destination.', 'disc')
         if self.need_disc() and (not self.xiso or not self.xiso.exists()):
             raise Stop('Choose your MechAssault 2 disc image (.xiso/.iso), or the folder copied from the disc.', 'disc')
+        if self.disc_validation_only():
+            if self.game_installed() or self.state.get('update') or self.state.get('done'):
+                raise Stop('Disc validation requires a fresh, empty destination; use a new destination to validate again.', 'disc')
+            if self.until == 'extract':
+                self.check_extraction_space(self.checked_disc_manifest())
+            return
+        if self.generation_only():
+            if self.game_installed() or self.state.get('update'):
+                raise Stop('Private generation requires a destination that is not an existing install or update.', 'disc')
+            manifest = self.checked_disc_manifest()
+            if self.pc_assets_only:
+                self.verify_disc_files(manifest)
+            elif 'extract' not in self.state.get('done', []):
+                self.check_extraction_space(manifest)
+            if not self.pc_assets_only:
+                try:
+                    import capstone
+                    capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+                except (ImportError, OSError) as e:
+                    raise Stop('Native Python Capstone is required for analysis and translation (%s).' % e, 'compiler')
+            return
         if not self.game_installed():
             try:
                 self.vcvars, self.cmake, self.ninja, self.vs = find_visual_studio(self.vs_choice)
@@ -1648,10 +1830,19 @@ class Installer:
         env = self.toolkit_env()
         self.run_cmd([sys.executable, bring / 'recover_callbacks.py'], cwd=self.work / 'toolkit', env=env, title='recover_callbacks')
         self.run_cmd([sys.executable, bring / 'optimize_leafs.py'], cwd=self.work / 'toolkit', env=env, title='optimize_leafs')
+        outputs = [bring / 'callbacks.json', bring / 'fastpaths.json', *(bring / 'regression').glob('*.c')]
+        for pattern in ('recomp_bringup*.c', 'recomp_bringup*.h', 'recomp_fastpaths.c'):
+            outputs.extend(gen.glob(pattern))
+        for path in outputs:                       # the bringup scripts use the host's default text newlines
+            if not path.is_file(): continue
+            data = path.read_bytes()
+            canonical = data.replace(b'\r\n', b'\n').replace(b'\n', b'\r\n')
+            if canonical != data: path.write_bytes(canonical)
 
     def patch(self):
         sys.path.insert(0, str(HERE))
         import gen_patch
+        if sys.platform != 'win32': self.generation_manifests('generate')
         gen = self.project() / 'src' / 'recomp' / 'gen'
         if self.state.get('patch_started') and gen_patch.base_mismatches(gen, KIT / 'patches'):
             self.log('  An earlier run stopped while applying the PC fixes, so the generated code is part-patched. '
@@ -1670,12 +1861,16 @@ class Installer:
         code by tools/fastcode.py (the release ships the tool, not the copies). Every file it writes is
         checked against the release's SHA-256."""
         fc = KIT / 'patches' / 'fastcode'
-        if not (fc / 'fastcode.json').is_file(): return
-        spec = json.loads((fc / 'fastcode.json').read_text(encoding='utf-8'))
+        if not (fc / 'fastcode.json').is_file():
+            if sys.platform != 'win32': raise Stop('The shipped FastCode manifest is missing; generation cannot be verified.')
+            return
+        spec = (self.generation_manifests('patch')[1] if sys.platform != 'win32' else
+                json.loads((fc / 'fastcode.json').read_text(encoding='utf-8')))
         for name in spec['lf']:                    # fastcode.py reads LF text; the toolkit writes CRLF
             p = gen / name
             p.write_bytes(p.read_bytes().replace(b'\r\n', b'\n'))
-        self.run_cmd([sys.executable, '-I', fc / 'fastcode.py', gen] + spec['whole'] + ['--hot', fc / spec['hot']]
+        python = [sys.executable] + (['-X', 'utf8'] if sys.platform != 'win32' else [])
+        self.run_cmd(python + ['-I', fc / 'fastcode.py', gen] + spec['whole'] + ['--hot', fc / spec['hot']]
                      + [a for n in spec.get('force', []) for a in ('--force', n)],
                      cwd=gen, title='fastcode', quiet_pattern=r'^\d{4} fast=')
         if spec.get('post'):                       # the release's hand edits made after FastCode (strict diffs)
@@ -1868,6 +2063,8 @@ class Installer:
                 'lighter_optimisation': {u: ' '.join(f for f in fl if f not in LOWMEM_ALL) for u, fl in sorted(units.items()) if lowmem_step_of(fl) >= 0}}
 
     def build(self):
+        if sys.platform != 'win32':
+            raise Stop('Compiling the game is not supported on this platform.', 'compiler')
         ffmpeg = self.ffmpeg_dir()                 # first: a download problem shows before the long compile
         if not hasattr(self, 'vcvars'): self.vcvars, self.cmake, self.ninja, self.vs = find_visual_studio(self.vs_choice)
         root = self.build_root()
@@ -1984,6 +2181,8 @@ class Installer:
             else: self.log('  (%s is not part of this installer; the game builds its shaders as it plays)' % n)
 
     def install(self):
+        if sys.platform != 'win32':
+            raise Stop('Installing or packaging the game is not supported on this platform.', 'compiler')
         if not hasattr(self, 'vs'): self.vcvars, self.cmake, self.ninja, self.vs = find_visual_studio(self.vs_choice)
         build = self.build_root() / 'build'
         exe = self.dest / 'MechAssault 2.exe'
@@ -2367,8 +2566,14 @@ def main():
     ap.add_argument('--include-botrec', action='store_true', help='with --diagnostics: include the newest bot match recording')
     ap.add_argument('--yes', action='store_true', help='with --uninstall: do not stop to ask')
     ap.add_argument('--until', help=argparse.SUPPRESS)   # stop after a step, e.g. patch (generated sources only)
+    ap.add_argument('--pc-assets-only', action='store_true',
+                    help='on non-Windows hosts, build checked PC assets from a completed private --until patch run')
     ap.add_argument('--vs', help=argparse.SUPPRESS)      # build with this VS/Build Tools installation folder
     a = ap.parse_args()
+    if a.pc_assets_only and (a.until or a.update or a.textures or a.videos or a.uninstall or a.diagnostics):
+        ap.error('--pc-assets-only cannot be combined with --until, --update, enhanced content, --uninstall or --diagnostics')
+    if a.pc_assets_only and sys.platform == 'win32':
+        ap.error('--pc-assets-only is for non-Windows generation; use the normal Windows install')
     if a.ffmpeg:                                  # a URL is passed as it is; a file or folder as a full path
         os.environ['MA2_FFMPEG_SOURCE'] = (a.ffmpeg.strip() if ffmpeg_fetch.is_url(a.ffmpeg.strip())
                                            else str(Path(precheck.clean_path(a.ffmpeg)).resolve()))
@@ -2393,7 +2598,8 @@ def main():
                      log=lambda line: print(line, flush=True), install_build_tools=a.install_build_tools, vs=a.vs,
                      update=a.update, shortcuts=shortcuts, merge_settings=not a.no_merge_settings,
                      switch_textures=a.switch_textures, low_priority=a.low_priority)
-    inst.until = a.until
+    inst.pc_assets_only = a.pc_assets_only
+    inst.until = 'assets' if a.pc_assets_only else a.until
     try:
         inst.run()
     except Stop as e:

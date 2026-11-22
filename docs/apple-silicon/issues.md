@@ -1,0 +1,62 @@
+# Apple Silicon issue register
+
+This register is for port work that has evidence and a next test. General game
+bugs still belong in the upstream issue tracker and factual reverse-engineering
+findings belong in the fact wiki.
+
+## Conventions
+
+- Priority: **P0** blocks guest initialization or first frame; **P1** blocks
+  normal gameplay; **P2** blocks a usable developer build; **P3** is deferred
+  tooling or polish.
+- Status: `open`, `in-progress`, `blocked`, `resolved`, or `deferred`.
+- Evidence: `confirmed`, `observed`, or `hypothesis`, as defined in
+  [README.md](README.md).
+- Resolution requires both the fix and its regression/validation command.
+
+## Issue status
+
+| ID | Priority | Status / evidence | Problem | Next proof |
+|---|---|---|---|---|
+| AS-000 | P0 | resolved / confirmed | The runtime/toolkit mix was classified against pinned xboxrecomp v0.18.0 without replacing MA2-specific subsystems. | Keep the inventory and upstream pin current when reconciling later generic changes. |
+| AS-001 | P0 | resolved / confirmed | The game and runtime graphs now select native arm64 macOS sources and gate RC, Win32 GUI, D3D11, XInput, and Windows packaging while retaining Windows configuration coverage. | Keep macOS host and private guest builds plus the MinGW structural gate passing. |
+| AS-002 | P0 | in-progress / confirmed | A portable SDL/AppKit host and private generated guest target now enter the retail XBE. Deterministic host input reaches mission loading and an active first-mission scene. Native settings, accepted gameplay behavior, polished distribution, and cooperative post-entry shutdown are incomplete. | Validate movement, camera, weapons, HUD, AI, audio, and save/restart with a physical controller, then add cooperative retail exit. |
+| AS-004 | P0 | in-progress / confirmed | The private guest now registers an Apple-only synchronous Metal backend. Masked pitched clears, supported 2D textures/register combiners, transformed triangles, alpha tests, depth/blend/cull/scissor, alias, failure, and fallback behavior have focused coverage. A retail probe accepted only the initial clear: active visibility counting deliberately prevents the approximately 2,793 settled-scene batches per frame from invoking Metal draws because the backend cannot return exact `GET_REPORT` counts yet. | Add exact visibility-counted draws and report-ordering tests without approximation, then move targets/textures/presentation to cached GPU-resident resources while retaining the CPU oracle. |
+| AS-005 | P0 | resolved / confirmed | Darwin fixed/OS-chosen mappings, mirrors, 16 KB protection constraints, guest allocation, teardown, and the validated XBE layout pass native synthetic and private retail startup. | Retain the mapping and neighboring-page regression suites. |
+| AS-006 | P1 | in-progress / confirmed | SDL audio now implements the MA2 queue contract and retail APU/DSP startup runs, but physical audible output, long-run pacing, device loss, and underrun behavior have not been accepted. | Validate a physical synthetic tone, then title and campaign audio with queue-depth and underrun telemetry. |
+| AS-007 | P1 | in-progress / confirmed | The Apple guest currently links no-op native Bink contracts, so retail movies use the lifted guest decoder. A traced corrupted campaign frame is only a fullscreen quad over a 720x480 linear texture; the white blocks already exist in that decoded/uploaded surface before NV2A composition. Persistently acknowledging safe-start loops the Day 1 seek/stop path. One-shot per-lifecycle rearming instead passed a 140-second retail route through the logo, difficulty selection, mission loading, and active first-mission entry without presenting the corrupted campaign movie. | Retain the focused nested/sequential lifecycle regression and verify optional movie routes as they become relevant. Later, port the existing FFmpeg-based native Bink path to macOS and test CPU-buffer decode, upload, and audio sync. |
+| AS-008 | P1 | in-progress / confirmed | SDL mapping, hotplug, keyboard fallback, capture, OHCI delivery, and scripted in-window key diagnostics have synthetic coverage. Append-only `RECOMP_UI_LIVE` commands traverse the real UI through difficulty selection, mission loading, active mission execution, and the retail `Resume Game` pause menu. Late Return input proved an apparently repeated scene was waiting for route input rather than a stopped executor. A 330-second movement/camera/fire probe produced 243 captures with 197 unique images, but every timed command landed during the letterboxed in-engine cinematic, so player control remains unproven. Its status 3 was the configured watchdog because `close` was scheduled too late. | Re-run commands only after the cinematic reaches an unambiguous HUD/player-control state and schedule close before the watchdog, then repeat with a physical controller and validate prompts, rumble, disconnect handling, audio, and save/restart. |
+| AS-009 | P1 | resolved / confirmed | The owner-controlled main-disc archive and complete extracted US/NTSC manifest passed the existing validation pipeline. The bonus disc remains out of scope and all derived inputs remain private. | Keep exact manifest enforcement and privacy scans; never infer compatibility from a filename. |
+| AS-010 | P2 | deferred / confirmed | The end-to-end installer, dependency bundle, launcher, diagnostics collection, and release build assume Windows/MSVC. | Resume after AS4. First produce a documented command-line developer build; then design a `.app` bundle, signing, notarization, and dependency policy. |
+| AS-011 | P3 | deferred / confirmed | The scenario editor is a Win32 + Direct3D 11 application, although much of its format/model code is CPU-only C++. | Make CPU-only format tests host-buildable after the game is playable; choose a GUI/rendering strategy separately. |
+| AS-012 | P0 | in-progress / confirmed | Host-owned signal chaining, the bounded MMIO broker, and guest-capable thread registration now survive real retail entry through title rendering. Cooperative quiescence after generated entry is not proven because current probes end through the watchdog. | Add a controlled guest stop/exit route and repeat startup/shutdown without leaked producers, handles, mappings, or device threads. |
+| AS-013 | P0 | resolved / confirmed | POSIX lacked `FileAllocationInformation` and `FileRenameInformation`, producing retail archive errors 6 and 7 during `D:` to `Z:` cache promotion. It also leaked completed directory-enumeration contexts. | Allocation/rename/repeated-query regression coverage passes, and a fresh-cache retail run completes all three promotions without the archive or disc-error path. |
+| AS-014 | P1 | resolved / confirmed | The diagonal/dotted streaks came from W-only clipping of geometry between the eye and near-Z plane. Homogeneous screen-times-W clipping against W and near-Z removes them; `RECOMP_CLIP_NEAR_Z=0` reproduces them in a controlled A/B. Triangle-strip winding was not the cause of this near-plane artifact, but was later confirmed as a separate registered-fallback fragmentation bug under AS-018. | Keep near-Z clipping enabled by default and retain the diagnostic disable only for controlled comparisons; keep the two artifact classes distinct. |
+| AS-015 | P0 | in-progress / confirmed | Correctly rendering complete triangle strips leaves complex title/hub scenes at roughly 1.07-1.14 FPS. A corrected settled mission shot measured about 1.37 FPS with 728-734 ms of draw work and roughly 72 ms of vertex work per frame. The opt-in persistent pthread row pool has exact synthetic coverage and raised a representative mission passage to roughly 2.4-2.5 FPS with four workers, but fixed-time input reached different frames and later dense shots fell below 1 FPS, so this is not a hash-aligned acceptance A/B. The Metal retail probe accepted only its initial clear because visibility-counted draws have no exact backend result path. | Keep POSIX serial by default. Implement exact Metal visibility results, then replace synchronous allocation/wait/readback with cached GPU-resident targets, textures, pipelines, bounded frames in flight, and measured presentation pacing. |
+| AS-016 | P1 | open / observed | Kernel ordinal 270, an exercised `NtFsControlFile`, TV encoder option `0x0F`, nonvolatile settings `0x104` and `0xFFFF`, and lifted `in/out`, `cli/sti`, `cpuid`, and `wbinvd` paths remain unresolved or intentional no-ops. | Classify each against the first campaign route and implement only behavior proven necessary, with focused regression coverage. |
+| AS-017 | P0 | resolved / confirmed | Reusing a protected 4 KiB contiguous allocation on a 16 KiB Darwin host page could not restore write protection, producing repeated reset failures and a mission-load `SIGBUS`. POSIX contiguous blocks now use host-page alignment and rounded sizes when the host page exceeds 4 KiB. | Injected and production regressions protect, release, reallocate, and write the same class of block; a 112-second scripted route under a 120-second watchdog reached active mission execution without the reset error or fault. |
+| AS-018 | P0 | in-progress / confirmed | The CPU-only oracle showed coherent mission characters while Metal registration plus CPU fallback lost every odd strip triangle; shared hardware-correct strip decomposition now restores coherent geometry. Morton-order type-2 output and mirror/border texture addressing are corrected. The D3D shader's stage selectors, dot mappings, bump environment/luminance, and dependent/dot/reflection modes 6, 7, and 9 through 18 are now ported with focused regressions. A matching first-mission A/B replaces the large purple floor bands with a coherent dark floor and removes widespread white horizontal flecks; the full trace emits no unsupported-stage diagnostic. Thin purple/yellow lines around lamps and vehicle geometry remain unclassified. White cinematic blocks remain the separate AS-007 source-movie defect. | Classify the remaining thin lines against intended emissive geometry; if incorrect, isolate their responsible draw with the retained pixel/depth and texture trace before changing renderer behavior. |
+
+## Resolved issues
+
+| ID | Status / evidence | Resolution | Regression evidence |
+|---|---|---|---|
+| AS-003 | resolved / confirmed | The exact generated header is adapted through a manifest-verified private VFS overlay. Unaligned access, x87 comparison/rounding, wrapped stack cleanup, `PMADDWD`, trace atomics, TLS/linkage, UTF-16, and LP64 `LONG` behavior have explicit arm64 implementations. The complete private generated core compiles as arm64 without changing its source tree. | The ABI CTest graph passes 23 native/sanitizer/architecture checks with one explicit unavailable-x86 skip. The aggregate private audit verifies all final manifest entries and generated units with zero mismatches, missing units, non-arm64 slices, or unexpected omitted tracked contracts. See [abi.md](abi.md). |
+
+A resolved issue requires:
+
+- the revision or pull request,
+- the exact validation command,
+- the host and architecture,
+- the expected and observed result, and
+- the regression test that would fail without the fix.
+
+## Upstream candidates
+
+| Issue | Candidate destination | Dependency | State |
+|---|---|---|---|
+| AS-000, AS-003, AS-005 | Prefer current xboxrecomp main first; propose only remaining generic gaps | A synthetic or existing conformance test | Upstream inventory required |
+| AS-004 | Full Metal renderer stays in this repository; renderer-neutral contract/helpers/tests may go to xboxrecomp | Current `Nv2aBackend`, issue #306 policy, synthetic fixture | Initial downstream Metal correctness slice and retail registration active; campaign state coverage remains |
+| AS-006, AS-008 | Prefer importing/adapting current upstream implementations; propose only MA2-independent gaps | Upstream SDL2 tests and real MA2 integration evidence | SDL audio/input adaptations and synthetic tests are active; physical retail validation remains |
+| AS-007 | xboxrecomp only for title-independent video hooks or helpers; MA2-specific FFmpeg integration stays here | Synthetic decoder/presentation test | Multi-movie safe-skip hook and regression integrated locally; native decoder contribution not yet prepared |
+| AS-001, AS-002 | This repository first; generic abstractions may be split later | Portable game host boundary | Native host and private guest boundary implemented; upstream split not yet prepared |

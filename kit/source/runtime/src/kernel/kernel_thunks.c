@@ -66,6 +66,7 @@ static const char* xbox_log_level_str(int level)
  * game's own fprintf(stderr) lines that print a path.
  * ============================================================================ */
 
+#if defined(_WIN32)
 static size_t log_replace(wchar_t *s, size_t cap, size_t at, size_t old_len, const wchar_t *with)
 {
     size_t n = wcslen(s), w = wcslen(with);
@@ -118,6 +119,61 @@ void xbox_log_redact(char *s, size_t cap)
     xbox_log_redactw(wide, 2048);
     if (!WideCharToMultiByte(cp, 0, wide, -1, s, (int)cap, NULL, NULL)) snprintf(s, cap, "(text too long to log)");
 }
+#else
+static int redact_narrow(char *s, size_t cap, size_t at, size_t len, const char *token)
+{
+    size_t n = strlen(s), replacement = strlen(token);
+    if (n - len + replacement >= cap) {
+        snprintf(s, cap, "(redacted)");
+        return 0;
+    }
+    memmove(s + at + replacement, s + at + len, n - at - len + 1);
+    memcpy(s + at, token, replacement);
+    return 1;
+}
+
+void xbox_log_redact(char *s, size_t cap)
+{
+    if (!s || !cap) return;
+    const char *home = getenv("HOME");
+    if (home && *home && strcmp(home, "/") != 0) {
+        size_t n = strlen(home);
+        for (char *p = s; (p = strstr(p, home)) != NULL; ) {
+            if (p[n] == 0 || p[n] == '/' || p[n] == '"' || p[n] == ' ') {
+                if (!redact_narrow(s, cap, (size_t)(p - s), n, "$HOME")) return;
+                p += 5;
+            } else p += n;
+        }
+    }
+    const char *prefixes[] = { "/Users/", "/home/" };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i) {
+        size_t n = strlen(prefixes[i]);
+        for (char *p = s; (p = strstr(p, prefixes[i])) != NULL; ) {
+            char *start = p + n, *end = start;
+            while (*end && *end != '/' && *end != '"' && *end != ' ') ++end;
+            if (end > start) {
+                if (!redact_narrow(s, cap, (size_t)(start - s),
+                                   (size_t)(end - start), "<user>")) return;
+                p = start + 6;
+            } else p = end;
+        }
+    }
+}
+
+void xbox_log_redactw(wchar_t *s, size_t cap)
+{
+    if (!s || !cap) return;
+    /* Host wchar_t is not the Xbox's 16-bit WCHAR. Avoid casting between
+     * them; redact wide paths conservatively before any conversion. */
+    if (wcschr(s, L'/')) {
+        static const wchar_t replacement[] = L"(redacted path)";
+        size_t n = sizeof(replacement) / sizeof(replacement[0]) - 1;
+        if (n >= cap) n = cap - 1;
+        wmemcpy(s, replacement, n);
+        s[n] = 0;
+    }
+}
+#endif
 
 /* A path for a log line: copied into out and redacted. Returns out. */
 const char *xbox_log_path(const char *path, char *out, size_t size)
@@ -133,9 +189,17 @@ const char *xbox_log_pathw(const wchar_t *path, char *out, size_t size)
 {
     wchar_t wide[2048];
     if (!out || !size) return "";
-    swprintf(wide, 2048, L"%ls", path ? path : L"(null)");
+    if (swprintf(wide, 2048, L"%ls", path ? path : L"(null)") < 0) {
+        snprintf(out, size, "(path)");
+        return out;
+    }
     xbox_log_redactw(wide, 2048);
+#if defined(_WIN32)
     if (!WideCharToMultiByte(CP_ACP, 0, wide, -1, out, (int)size, NULL, NULL)) snprintf(out, size, "(path)");
+#else
+    if (wcstombs(out, wide, size) == (size_t)-1) snprintf(out, size, "(path)");
+    else out[size - 1] = 0;
+#endif
     return out;
 }
 
@@ -576,6 +640,10 @@ void xbox_kernel_shutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
         "=== Xbox Kernel Replacement Layer shutting down ===");
+
+    if (!xbox_kernel_bridge_quiesce())
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THUNK,
+            "Kernel bridge workers did not quiesce; guest memory must be retained");
 
     /* Close log file */
     if (g_log_file) {

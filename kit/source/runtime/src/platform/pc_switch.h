@@ -28,7 +28,11 @@ extern "C" {
 /* Reads [section] key from the live pc_settings.ini into out; returns 1 when the key is present and
  * not empty. Set by main.c; null in lib-only tests and before configure_pc() runs. */
 typedef int (*pc_switch_ini_fn)(const char *section, const char *key, char *out, unsigned out_size);
+#if defined(_MSC_VER)
 __declspec(selectany) pc_switch_ini_fn pc_switch_ini = 0;
+#else
+__attribute__((weak)) pc_switch_ini_fn pc_switch_ini = 0;
+#endif
 
 enum { PC_SWITCH_DEFAULT = 0, PC_SWITCH_INI = 1, PC_SWITCH_ENV = 2 };
 

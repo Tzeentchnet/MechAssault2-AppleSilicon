@@ -18,13 +18,14 @@
 #include "nv2a_gpu_memory.h"
 #include "../platform/pc_cpu_topo.h"
 #include "../platform/pc_switch.h"   /* T2-2: [Render] ExecWake */
-#include <intrin.h>   /* _mm_pause */
+#include "../platform/host_cpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
+#include "../platform/posix_mmio.h"
 #endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
@@ -47,6 +48,8 @@
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
+static int s_cleanup_incomplete;
+static void reset_layout_allocators(void);
 
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
@@ -82,6 +85,24 @@ static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
  * question. */
 static void *g_span_base = NULL;
 static size_t g_span_size = 0;
+#if !defined(_WIN32)
+static size_t g_span_stride = 0;
+static unsigned char g_span_owned[XBOX_NUM_MIRRORS + 1];
+
+static BOOL release_span_slice(unsigned index)
+{
+    if (!g_span_owned[index])
+        return TRUE;
+    void *base = (char *)g_span_base + index * g_span_stride;
+    if (!VirtualFree(base, g_span_stride, MEM_RELEASE)) {
+        fprintf(stderr, "  Could not release guest reservation slice %u at %p (error %lu)\n",
+                index, base, (unsigned long)GetLastError());
+        return FALSE;
+    }
+    g_span_owned[index] = 0;
+    return TRUE;
+}
+#endif
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -99,6 +120,22 @@ static void *g_nv2a_memory = NULL;
 #define XBOX_MCPX_BASE 0xFE800000u
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
 static void *g_mcpx_memory = NULL;
+#if !defined(_WIN32)
+static HANDLE g_mcpx_mapping = NULL;
+static void *g_mcpx_alias = NULL;
+static size_t g_mcpx_host_page = 0;
+#endif
+
+void *xbox_McpxMemoryAlias(uint32_t offset, size_t bytes)
+{
+    if (offset >= XBOX_MCPX_SIZE || bytes > XBOX_MCPX_SIZE - offset)
+        return NULL;
+#if !defined(_WIN32)
+    return g_mcpx_alias ? (char *)g_mcpx_alias + offset : NULL;
+#else
+    return g_mcpx_memory ? (char *)g_mcpx_memory + offset : NULL;
+#endif
+}
 
 /* Flash ROM. The console's 256 KB flash is mirrored through the top of the
  * address space, and the MCPX span above stops one page short of it -- so a
@@ -345,6 +382,7 @@ static void *g_ac97_page = NULL;      /* host address of the trapped page */
 static void *g_ac97_veh  = NULL;
 static RECOMP_TLS int s_ac97_stepping = 0;
 
+#if defined(_WIN32)
 static void ac97_clear_reset_bits(void)
 {
     /* Every bus-master channel, not the three a PC AC'97 has.
@@ -359,7 +397,12 @@ static void ac97_clear_reset_bits(void)
     uint32_t off;
 
     for (off = 0x10B; off < 0x180; off += 0x10) {
+#if defined(_WIN32)
         volatile uint8_t *r = (volatile uint8_t *)((char *)g_ac97_page + off);
+#else
+        volatile uint8_t *r = (volatile uint8_t *)
+            xbox_McpxMemoryAlias(AC97_NABM_OFFSET + off, 1);
+#endif
         if (*r & AC97_RR)
             *r = (uint8_t)(*r & ~AC97_RR);
     }
@@ -402,17 +445,19 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
+#endif
 
 /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
  * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
  * channel has nothing to gain from it, and the page fault costs something. */
-static void ac97_arm_write_trap(void)
+static BOOL ac97_arm_write_trap(void)
 {
     DWORD old;
 
     if (!g_mcpx_memory || g_ac97_page)
-        return;
+        return FALSE;
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
+#if defined(_WIN32)
     /* First, so it runs before the game target's own crash reporter, which
      * would otherwise print the write as an access violation. */
     g_ac97_veh = AddVectoredExceptionHandler(1, ac97_write_veh);
@@ -426,12 +471,58 @@ static void ac97_arm_write_trap(void)
         g_ac97_page = NULL;
         fprintf(stderr, "  AC97: could not arm the bus-master write trap;"
                         " a channel reset will spin\n");
-        return;
+        return FALSE;
     }
+#else
+    if (!g_mcpx_host_page ||
+        !VirtualProtect(g_ac97_page, g_mcpx_host_page, PAGE_READONLY, &old)) {
+        g_ac97_page = NULL;
+        fprintf(stderr, "  AC97: could not arm the bus-master write trap (error %lu)\n",
+                (unsigned long)GetLastError());
+        return FALSE;
+    }
+#endif
     fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
                     " (channel reset completes on write)\n",
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+    return TRUE;
 }
+
+#if defined(__aarch64__) && !defined(_WIN32)
+int xbox_Ac97OwnsAddress(uint32_t va)
+{
+    uint32_t base = XBOX_MCPX_BASE + AC97_NABM_OFFSET;
+    return g_ac97_page && va >= base && (uint64_t)va < (uint64_t)base + g_mcpx_host_page;
+}
+
+void xbox_Ac97PosixAccess(uint32_t off, uint64_t *value, unsigned size, int write)
+{
+    uint8_t *p = xbox_McpxMemoryAlias(off, size);
+    if (!p) return;
+    if (write) {
+        for (unsigned i = 0; i < size; ++i) {
+            uint32_t at = off + i;
+            uint8_t byte = (uint8_t)(*value >> (8 * i));
+            if (at >= AC97_NABM_OFFSET + 0x10bu &&
+                at < AC97_NABM_OFFSET + 0x180u &&
+                ((at - (AC97_NABM_OFFSET + 0x10bu)) & 0x0fu) == 0)
+                byte &= (uint8_t)~AC97_RR;
+            __atomic_store_n(&p[i], byte, __ATOMIC_RELAXED);
+        }
+    } else {
+        uint64_t result = 0;
+        for (unsigned i = 0; i < size; ++i)
+            result |= (uint64_t)__atomic_load_n(&p[i], __ATOMIC_RELAXED) << (8 * i);
+        *value = result;
+    }
+}
+
+int xbox_Ac97HandleMmio(void *context, uint32_t va)
+{
+    if (va < XBOX_MCPX_BASE) return 0;
+    return xbox_PosixMmioFaultOffset(context, va - XBOX_MCPX_BASE);
+}
+#endif
 
 /*
  * Command words the DSP stub completes instantly. A bring-up probe, not a
@@ -571,6 +662,18 @@ static void *g_mcpx_regs = NULL;
  * counter ticking below must leave them alone -- writing through the pointer
  * faults, and the emulated APU owns those registers anyway. */
 static int g_apu_mmio_trapped = 0;
+#if defined(__aarch64__) && !defined(_WIN32)
+int xbox_ApuMmioOwnsAddress(uint32_t va)
+{
+    if (!g_apu_mmio_trapped || !g_mcpx_host_page || va < XBOX_MCPX_BASE)
+        return 0;
+    uint32_t off = va - XBOX_MCPX_BASE;
+    uint32_t mask = (uint32_t)g_mcpx_host_page - 1;
+    return off < 0x30000u ||
+        (off >= (0x3F000u & ~mask) && off < 0x40000u) ||
+        (off >= (0x5F000u & ~mask) && off < 0x60000u);
+}
+#endif
 
 /*
  * GPU completion fences the title waits on in guest memory rather than in the
@@ -1023,7 +1126,11 @@ static void nv2a_idle_wait(int active, volatile uint32_t *regs)
         mode = e && *e == '1' ? 0 : 1;
         QueryPerformanceFrequency(&freq);
         if (mode) {
+#if defined(_WIN32)
             timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+#else
+            timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+#endif
             if (!timer) mode = 0;
         }
     }
@@ -1045,7 +1152,7 @@ static void nv2a_idle_wait(int active, volatile uint32_t *regs)
         s_wake.polls++;
         for (;;) {
             LARGE_INTEGER t;
-            for (int k = 0; k < 64; k++) _mm_pause();
+            for (int k = 0; k < 64; k++) xbox_host_cpu_relax();
             if (nv2a_wake_pending(regs)) { s_wake.poll_hits++; nv2a_prof_acc(5 /* spin */, pt); return; }
             QueryPerformanceCounter(&t);
             if (t.QuadPart >= deadline) break;
@@ -1257,7 +1364,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
-static void xbox_Nv2aAckStart(void)
+static int xbox_Nv2aAckStart(void)
 {
     dsp_ack_init();
     poke_init();
@@ -1267,7 +1374,11 @@ static void xbox_Nv2aAckStart(void)
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
+        return 1;
     }
+    fprintf(stderr, "  NV2A busy-bit ack: could not start worker (error %lu)\n",
+            (unsigned long)GetLastError());
+    return 0;
 }
 
 /* Separate allocation for Xbox kernel address space (0x80010000+).
@@ -1300,11 +1411,11 @@ uint32_t g_xbox_code_hi = 0;
  * a spawned thread gets its own from xbox_AllocThreadTib(). */
 RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
 
-/* The shape of the TLS block the loader built, so a new thread can be
- * given one just like it: where the initialised image data starts, how
- * big the block is, and how big the per-thread structure slot 0 points
- * at is. Zero total means the image had no TLS directory. */
-static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
+/* Keep an immutable initial image: the main thread may change its own TLS
+ * before another guest thread starts. */
+static uint8_t *g_tls_template;
+static uint32_t g_tls_total, g_tls_thread_size = 64;
+static uint8_t g_tib_template[0x40];
 
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
@@ -1523,6 +1634,7 @@ static int peek_readable(uint32_t va)
  * Off unless RECOMP_WATCH is set. Costs a page fault per write to that page,
  * so it is a bring-up tool and says so.
  */
+#if defined(_WIN32)
 static uint32_t g_watch_va;
 static void    *g_watch_page;
 static uint32_t g_watch_last;
@@ -1754,6 +1866,21 @@ void xbox_WatchArmVa(uint32_t va, int max_reports)
     s_watch_left = max_reports > 0 ? max_reports : -1;
     watch_arm(va);
 }
+#else
+void xbox_WatchInit(void)
+{
+    const char *spec = getenv("RECOMP_WATCH");
+    if (spec && *spec)
+        fprintf(stderr, "  WATCH: Windows single-step watchpoints are unavailable on this host\n");
+}
+
+void xbox_WatchArmVa(uint32_t va, int max_reports)
+{
+    (void)va;
+    (void)max_reports;
+    fprintf(stderr, "  WATCH: Windows single-step watchpoints are unavailable on this host\n");
+}
+#endif
 
 /* Print the RECOMP_PEEK globals. Shared, because the two moments worth
  * sampling are a hang and an early exit, and only the first had it: a title
@@ -1933,16 +2060,49 @@ volatile uint64_t g_icall_count = 0;
 /* W-11: each window the game needs; a failed one used to warn and go on to a generic crash later. */
 static unsigned s_layout_failed;
 
+#if !defined(_WIN32)
+static int mirror_conflicts_with_aperture(unsigned mirror)
+{
+    uint64_t lo = (uint64_t)mirror * g_memory_size;
+    uint64_t hi = lo + g_memory_size;
+    const uint64_t ranges[][2] = {
+        { XBOX_CONTIG_BASE, (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE },
+        { XBOX_TILED_BASE, (uint64_t)XBOX_TILED_BASE + xbox_TiledApertureSize() },
+        { XBOX_NV2A_BASE, (uint64_t)XBOX_NV2A_BASE + XBOX_NV2A_SIZE },
+        { XBOX_MCPX_BASE, (uint64_t)XBOX_MCPX_BASE + XBOX_MCPX_SIZE },
+        { XBOX_FLASH_BASE, (uint64_t)XBOX_FLASH_BASE + XBOX_FLASH_SIZE },
+    };
+    if (hi > UINT64_C(0x100000000))
+        return 1;
+    for (size_t i = 0; i < sizeof(ranges) / sizeof(ranges[0]); ++i)
+        if (lo < ranges[i][1] && ranges[i][0] < hi)
+            return 1;
+    return 0;
+}
+#endif
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
+    if (!xbe_data || xbe_size < XBE_TLS_ADDR_OFFSET + sizeof(uint32_t)) {
+        fprintf(stderr, "xbox_MemoryLayoutInit: XBE header is missing or truncated\n");
+        return FALSE;
+    }
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (getenv("RECOMP_AC97_READY") && !xbox_PosixMmioIsStarted()) {
+        fprintf(stderr, "xbox_MemoryLayoutInit: start the POSIX MMIO broker before trapping APU/AC97\n");
+        return FALSE;
+    }
+#endif
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;
 
-    if (g_memory_base) {
-        fprintf(stderr, "xbox_MemoryLayoutInit: already initialized\n");
+    if (g_memory_base || g_span_base || s_cleanup_incomplete) {
+        fprintf(stderr, "xbox_MemoryLayoutInit: already initialized or cleanup incomplete\n");
         return FALSE;
     }
+    s_layout_failed = 0;
+    g_apu_mmio_trapped = 0;
 
     /*
      * Calculate the full range we need to map.
@@ -1956,6 +2116,26 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * at multiples of this, so growing it is what stops a title's
      * above-RAM allocations from aliasing low memory. */
     g_memory_size = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+    if (!g_xbox_total_ram || g_xbox_total_ram > g_memory_size ||
+        g_memory_size > UINT32_MAX || (g_memory_size & 0xFFFu)
+#if !defined(_WIN32)
+        || g_memory_size > SIZE_MAX / (1u + XBOX_NUM_MIRRORS)
+#endif
+        ) {
+        fprintf(stderr, "xbox_MemoryLayoutInit: invalid RAM or mapped size\n");
+        g_memory_size = 0;
+        return FALSE;
+    }
+#if !defined(_WIN32)
+    {
+        long page = sysconf(_SC_PAGESIZE);
+        if (page <= 0 || g_memory_size % (size_t)page) {
+            fprintf(stderr, "xbox_MemoryLayoutInit: map size is not host-page aligned\n");
+            g_memory_size = 0;
+            return FALSE;
+        }
+    }
+#endif
 
     /*
      * Create a file mapping backed by the page file.
@@ -1978,7 +2158,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     );
     if (!g_mapping_handle) {
         fprintf(stderr, "xbox_MemoryLayoutInit: CreateFileMapping failed (error %lu)\n",
-                GetLastError());
+                (unsigned long)GetLastError());
         return FALSE;
     }
 
@@ -2021,15 +2201,17 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
-            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
-            g_memory_base = MapViewOfFileEx(g_mapping_handle,
+            g_span_stride = g_memory_size;
+            memset(g_span_owned, 1, sizeof(g_span_owned));
+            if (release_span_slice(0))
+                g_memory_base = MapViewOfFileEx(g_mapping_handle,
                                             FILE_MAP_ALL_ACCESS, 0, 0,
                                             g_memory_size, g_span_base);
-            if (!g_memory_base) {
-                VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
-                g_span_base = NULL;
-                g_span_size = 0;
-            }
+        }
+        if (!g_memory_base) {
+            fprintf(stderr, "xbox_MemoryLayoutInit: could not reserve and map the guest mirror span\n");
+            xbox_MemoryLayoutShutdown();
+            return FALSE;
         }
 #endif
 
@@ -2062,6 +2244,16 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         g_mapping_handle = NULL;
         return FALSE;
     }
+
+#if !defined(_WIN32)
+    /* Free conflicting slices before placing the device windows, not after. */
+    for (unsigned m = 1; m <= XBOX_NUM_MIRRORS; ++m) {
+        if (mirror_conflicts_with_aperture(m) && !release_span_slice(m)) {
+            xbox_MemoryLayoutShutdown();
+            return FALSE;
+        }
+    }
+#endif
 
     g_memory_offset = (uintptr_t)g_memory_base - XBOX_MAP_START;
 
@@ -2117,10 +2309,16 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             fprintf(stderr, "  RECOMP_TRAP_NULL: not available -- the host page "
                     "is %ld bytes, so trapping guest page zero would also trap "
                     "the TIB at 0x%08X\n", host_page, XBOX_TIB_MAIN);
+            s_layout_failed |= 0x80;
         } else {
-            if (VirtualProtect(g_memory_base, 0x1000, PAGE_NOACCESS, &old_protect)) {
+            if (host_page > 0 &&
+                VirtualProtect(g_memory_base, (SIZE_T)host_page, PAGE_NOACCESS, &old_protect)) {
                 fprintf(stderr, "  guest page 0 is PAGE_NOACCESS"
                                 " (null dereferences fault)\n");
+            } else {
+                fprintf(stderr, "  RECOMP_TRAP_NULL: could not protect the host page (error %lu)\n",
+                        (unsigned long)GetLastError());
+                s_layout_failed |= 0x80;
             }
         }
     }
@@ -2435,9 +2633,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * than being left NULL, which had SetLastError writing the error code
          * over fs:[4] itself and the next call faulting at guest 0xFFFFFFEF.
          *
-         * ponytail: one block for the whole process, not one per thread.
-         * Every guest thread therefore shares LastError. Give this a per-thread
-         * allocation when a title is observed to care.
+         * This block belongs to the initial guest thread. New threads copy an
+         * immutable snapshot and receive separate per-thread data.
          */
         #define FAKE_TLS_BLOCK_VA  0x00770000  /* image TLS data          */
         #define FAKE_TLS_THREAD_VA 0x00770200  /* what slot 0 points at   */
@@ -2445,35 +2642,54 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             DWORD tls_dir_va = *(const DWORD *)(xbe + XBE_TLS_ADDR_OFFSET);
 
             if (tls_dir_va) {
-                const uint32_t *tls = (const uint32_t *)XBOX_VA(tls_dir_va);
-                uint32_t data_start = tls[0];
-                uint32_t data_end   = tls[1];
-                uint32_t zero_fill  = tls[4];
-                uint32_t init_size  = (data_end > data_start)
-                                    ? data_end - data_start : 0;
-                uint32_t total      = ((init_size + zero_fill + 0xF) & ~0xFu) + 4;
-
-                memset(XBOX_VA(FAKE_TLS_BLOCK_VA), 0, total);
-                memset(XBOX_VA(FAKE_TLS_THREAD_VA), 0, 64);
-                if (init_size)
-                    memcpy(XBOX_VA(FAKE_TLS_BLOCK_VA),
-                           XBOX_VA(data_start), init_size);
-
-                MEM32_INIT(FAKE_TLS_BLOCK_VA, FAKE_TLS_THREAD_VA);
-                MEM32_INIT(XBOX_FS_BASE + 0x04, FAKE_TLS_BLOCK_VA + total);
-
-                g_tls_template_va = FAKE_TLS_BLOCK_VA;
-                g_tls_total       = total;
-
-                fprintf(stderr, "  TLS: %u-byte block at 0x%08X,"
-                        " fs:[4] = 0x%08X (index will be %d)\n",
-                        total, FAKE_TLS_BLOCK_VA, FAKE_TLS_BLOCK_VA + total,
-                        -(int)(total / 4));
+                uint32_t tls[5];
+                if (tls_dir_va < XBOX_BASE_ADDRESS ||
+                    (uint64_t)tls_dir_va + sizeof(tls) > g_memory_size) {
+                    s_layout_failed |= 0x200;
+                } else {
+                    memcpy(tls, XBOX_VA(tls_dir_va), sizeof(tls));
+                    uint32_t data_start = tls[0], data_end = tls[1];
+                    uint32_t init_size = data_end >= data_start
+                                       ? data_end - data_start : 0;
+                    uint64_t total64 = (((uint64_t)init_size + tls[4] + 15u)
+                                        & ~(uint64_t)15u) + 4u;
+                    uint64_t thread64 = ((uint64_t)FAKE_TLS_BLOCK_VA + total64 + 15u)
+                                        & ~(uint64_t)15u;
+                    if (thread64 < FAKE_TLS_THREAD_VA)
+                        thread64 = FAKE_TLS_THREAD_VA;
+                    if (data_end < data_start ||
+                        (init_size && (data_start < XBOX_BASE_ADDRESS ||
+                                       data_end > g_memory_size)) ||
+                        total64 > UINT32_MAX || thread64 + 64u > XBOX_STACK_BASE ||
+                        thread64 + 64u > g_memory_size) {
+                        s_layout_failed |= 0x200;
+                    } else {
+                        uint32_t total = (uint32_t)total64;
+                        uint32_t thread_data = (uint32_t)thread64;
+                        g_tls_template = (uint8_t *)calloc(1, total);
+                        if (!g_tls_template) {
+                            s_layout_failed |= 0x200;
+                        } else {
+                            if (init_size)
+                                memcpy(g_tls_template, XBOX_VA(data_start), init_size);
+                            memcpy(g_tls_template, &thread_data, sizeof(thread_data));
+                            memcpy(XBOX_VA(FAKE_TLS_BLOCK_VA), g_tls_template, total);
+                            memset(XBOX_VA(thread_data), 0, 64);
+                            MEM32_INIT(XBOX_FS_BASE + 0x04, FAKE_TLS_BLOCK_VA + total);
+                            g_tls_total = total;
+                            fprintf(stderr, "  TLS: %u-byte block at 0x%08X,"
+                                    " fs:[4] = 0x%08X (index will be %d)\n",
+                                    total, FAKE_TLS_BLOCK_VA, FAKE_TLS_BLOCK_VA + total,
+                                    -(int)(total / 4));
+                        }
+                    }
+                }
             }
         }
         #undef FAKE_TLS_BLOCK_VA
         #undef FAKE_TLS_THREAD_VA
 
+        memcpy(g_tib_template, XBOX_VA(XBOX_TIB_MAIN), sizeof(g_tib_template));
         fprintf(stderr, "  TIB: fake TIB at VA 0x%X, TLS at 0x%08X, RW data at 0x%08X\n",
                 XBOX_FS_BASE, FAKE_TLS_VA, FAKE_RWDATA_VA);
 
@@ -2523,7 +2739,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             s_layout_failed |= 0x01; fprintf(stderr, "  WARNING: contiguous window at 0x%08X failed "
                     "(error %lu); pinned physical allocations will fault\n",
-                    XBOX_CONTIG_BASE, GetLastError());
+                    XBOX_CONTIG_BASE, (unsigned long)GetLastError());
         }
     }
 
@@ -2565,7 +2781,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             s_layout_failed |= 0x02; fprintf(stderr, "  WARNING: NV2A aperture at 0x%08X failed "
                     "(error %lu); D3D register access will fault\n",
-                    XBOX_NV2A_BASE, GetLastError());
+                    XBOX_NV2A_BASE, (unsigned long)GetLastError());
         }
     }
 
@@ -2592,12 +2808,43 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
+#if defined(_WIN32)
         g_mcpx_memory = VirtualAlloc(
             (LPVOID)mcpx_native,
             XBOX_MCPX_SIZE,
             MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE
         );
+#else
+        /* The guest view may need a 16 KB protection for a 4 KB device page.
+         * A second, unprotected view keeps adjacent RAM and the DSP's direct
+         * program-memory pointers backed by the same bytes. */
+        g_mcpx_mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
+                                             PAGE_READWRITE, 0,
+                                             XBOX_MCPX_SIZE, NULL);
+        if (g_mcpx_mapping) {
+            g_mcpx_memory = MapViewOfFileEx(g_mcpx_mapping, FILE_MAP_ALL_ACCESS,
+                                           0, 0, XBOX_MCPX_SIZE,
+                                           (void *)mcpx_native);
+            if (g_mcpx_memory)
+                g_mcpx_alias = MapViewOfFile(g_mcpx_mapping, FILE_MAP_ALL_ACCESS,
+                                            0, 0, XBOX_MCPX_SIZE);
+            if (!g_mcpx_alias && g_mcpx_memory) {
+                UnmapViewOfFile(g_mcpx_memory);
+                g_mcpx_memory = NULL;
+            }
+        }
+        {
+            long page = sysconf(_SC_PAGESIZE);
+            if (page < 4096 || page > 65536 || (page & (page - 1)) != 0 ||
+                (0x30000u % (unsigned long)page) != 0) {
+                fprintf(stderr, "  MCPX: unsupported host page size %ld\n", page);
+                s_layout_failed |= 0x04;
+            } else {
+                g_mcpx_host_page = (size_t)page;
+            }
+        }
+#endif
         g_mcpx_regs = g_mcpx_memory;
         if (g_mcpx_memory) {
             /* AC'97 codec ready.
@@ -2653,6 +2900,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  * memory keeps what the title writes. */
                 enum { APU_TRAP_BYTES = 0x00030000 };
                 DWORD old_protect;
+#if defined(_WIN32)
                 if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
@@ -2668,12 +2916,38 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                                     " (DSP memory as RAM, reset pages trapped)\n",
                             XBOX_MCPX_BASE, XBOX_MCPX_BASE + APU_TRAP_BYTES);
                 }
+#elif defined(__aarch64__)
+                if (g_mcpx_host_page) {
+                    size_t mask = g_mcpx_host_page - 1;
+                    size_t gp = 0x3F000u & ~mask, ep = 0x5F000u & ~mask;
+                    if (VirtualProtect(g_mcpx_memory, APU_TRAP_BYTES,
+                                       PAGE_NOACCESS, &old_protect) &&
+                        VirtualProtect((char *)g_mcpx_memory + gp, g_mcpx_host_page,
+                                       PAGE_NOACCESS, &old_protect) &&
+                        VirtualProtect((char *)g_mcpx_memory + ep, g_mcpx_host_page,
+                                       PAGE_NOACCESS, &old_protect)) {
+                        g_apu_mmio_trapped = 1;
+                        fprintf(stderr, "  APU: registers and DSP reset pages trapped; adjacent RAM uses a shared alias\n");
+                    } else {
+                        fprintf(stderr, "  APU: could not protect device pages (error %lu)\n",
+                                (unsigned long)GetLastError());
+                        s_layout_failed |= 0x04;
+                    }
+                }
+#else
+                fprintf(stderr, "  APU: trapped POSIX MMIO requires an AArch64 decoder\n");
+                s_layout_failed |= 0x04;
+#endif
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
                     |= MCPX_AC97_CODEC_READY;
                 /* Before the trap is armed: this write would otherwise be
                  * the first thing to fault. */
-                ac97_arm_write_trap();
+                if (!ac97_arm_write_trap()) {
+#if !defined(_WIN32)
+                    s_layout_failed |= 0x04;
+#endif
+                }
                 fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
                                 " (DirectSound will initialise)\n",
                         XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
@@ -2684,7 +2958,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             s_layout_failed |= 0x04; fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
                     "(error %lu); USB/audio register access will fault\n",
-                    XBOX_MCPX_BASE, GetLastError());
+                    XBOX_MCPX_BASE, (unsigned long)GetLastError());
         }
     }
 
@@ -2705,13 +2979,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             s_layout_failed |= 0x08; fprintf(stderr, "  WARNING: flash aperture at 0x%08X failed "
                     "(error %lu); a title reading flash will fault\n",
-                    XBOX_FLASH_BASE, GetLastError());
+                    XBOX_FLASH_BASE, (unsigned long)GetLastError());
         }
     }
 
-    if (g_nv2a_memory) {
-        xbox_Nv2aAckStart();
-    }
+    if (g_nv2a_memory && !s_layout_failed && !xbox_Nv2aAckStart())
+        s_layout_failed |= 0x100;
 
     /*
      * Allocate a page at Xbox kernel address space (0x80010000).
@@ -2790,17 +3063,28 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
             uint64_t guest_hi = guest_lo + g_memory_size;
 
-            if (guest_lo < tiled_hi && tiled_lo < guest_hi) {
+            if ((guest_lo < tiled_hi && tiled_lo < guest_hi)
+#if !defined(_WIN32)
+                || mirror_conflicts_with_aperture((unsigned)m + 1)
+#endif
+                ) {
                 fprintf(stderr, "  Mirror %d: skipped, overlaps the tiled"
-                                " aperture at 0x%08X\n",
-                        m + 1, (unsigned)XBOX_TILED_BASE);
+                                " aperture or another device window\n", m + 1);
+#if !defined(_WIN32)
+                if (g_span_base && !release_span_slice((unsigned)m + 1))
+                    s_layout_failed |= 0x20;
+#endif
                 continue;
             }
             /* Inside the reservation this hands back the slice we are about
              * to use; outside it (no reservation) this is a no-op on an
              * address we never held. */
-            if (g_span_base)
-                VirtualFree((LPVOID)mirror_base, g_memory_size, MEM_RELEASE);
+#if !defined(_WIN32)
+            if (g_span_base && !release_span_slice((unsigned)m + 1)) {
+                s_layout_failed |= 0x20;
+                continue;
+            }
+#endif
             g_mirror_views[m] = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
@@ -2812,7 +3096,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 mirrors_ok++;
             } else {
                 s_layout_failed |= 0x20; fprintf(stderr, "  Mirror %d: FAILED at %p (error %lu)\n",
-                        m + 1, (void *)mirror_base, GetLastError());
+                        m + 1, (void *)mirror_base, (unsigned long)GetLastError());
             }
         }
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
@@ -2906,7 +3190,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         } else {
             s_layout_failed |= 0x40; fprintf(stderr, "  WARNING: tiled aperture at 0x%08X failed"
                     " (error %lu); rendering writes will fault\n",
-                    XBOX_TILED_BASE, GetLastError());
+                    XBOX_TILED_BASE, (unsigned long)GetLastError());
         }
     }
 
@@ -2917,6 +3201,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
     if (s_layout_failed) {
         fprintf(stderr, "xbox_MemoryLayoutInit: required windows failed mask=%02X\n", s_layout_failed);
+        xbox_MemoryLayoutShutdown();
         return FALSE;
     }
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
@@ -2952,77 +3237,166 @@ void xbox_ProtectMirrorsForDebug(void)
             n, XBOX_NUM_MIRRORS);
 }
 
-void xbox_MemoryLayoutShutdown(void)
+static int release_layout_view(void **address, const char *name)
 {
+    if (!*address) return 1;
+    if (!UnmapViewOfFile(*address)) {
+        fprintf(stderr, "  Could not unmap %s at %p (error %lu)\n",
+                name, *address, (unsigned long)GetLastError());
+        return 0;
+    }
+    *address = NULL;
+    return 1;
+}
+
+static int release_layout_memory(void **address, const char *name)
+{
+    if (!*address) return 1;
+    if (!VirtualFree(*address, 0, MEM_RELEASE)) {
+        fprintf(stderr, "  Could not release %s at %p (error %lu)\n",
+                name, *address, (unsigned long)GetLastError());
+        return 0;
+    }
+    *address = NULL;
+    return 1;
+}
+
+static int close_layout_mapping(HANDLE *handle, const char *name)
+{
+    if (!*handle) return 1;
+    if (!CloseHandle(*handle)) {
+        fprintf(stderr, "  Could not close %s (error %lu)\n",
+                name, (unsigned long)GetLastError());
+        return 0;
+    }
+    *handle = NULL;
+    return 1;
+}
+
+BOOL xbox_MemoryLayoutShutdownChecked(void)
+{
+#if defined(__aarch64__) && !defined(_WIN32)
+    if (xbox_PosixMmioIsBound()) {
+        fprintf(stderr, "  POSIX MMIO remains attached; stop the broker before releasing memory\n");
+        return FALSE;
+    }
+#endif
+    int released = 1;
+    if (g_nv2a_ack_thread) {
+        InterlockedExchange(&g_nv2a_ack_stop, 1);
+        if (WaitForSingleObject(g_nv2a_ack_thread, INFINITE) != WAIT_OBJECT_0) {
+            fprintf(stderr, "  Could not join NV2A ack worker (error %lu); memory retained\n",
+                    (unsigned long)GetLastError());
+            return FALSE;
+        }
+        if (!close_layout_mapping(&g_nv2a_ack_thread, "NV2A worker handle"))
+            released = 0;
+    }
     xbox_ClockStop(); /* No writes into the data export after it is unmapped. */
     nv2a_gpu_memory_shutdown();
     if (g_kernel_memory) {
-        VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
-        g_kernel_memory = NULL;
+        if (g_contig_memory) g_kernel_memory = NULL;
+        else if (!release_layout_memory(&g_kernel_memory, "kernel page")) released = 0;
     }
-    if (g_nv2a_ack_thread) {
-        InterlockedExchange(&g_nv2a_ack_stop, 1);
-        WaitForSingleObject(g_nv2a_ack_thread, 1000);
-        CloseHandle(g_nv2a_ack_thread);
-        g_nv2a_ack_thread = NULL;
-    }
-    if (g_nv2a_memory) {
-        VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
-        g_nv2a_memory = NULL;
-    }
+    if (!release_layout_memory(&g_nv2a_memory, "NV2A aperture")) released = 0;
     /* Unmap mirror views first */
-    for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
-        if (g_mirror_views[m]) {
-            UnmapViewOfFile(g_mirror_views[m]);
-            g_mirror_views[m] = NULL;
-        }
-    }
+    for (int m = 0; m < XBOX_NUM_MIRRORS; m++)
+        if (!release_layout_view(&g_mirror_views[m], "RAM mirror")) released = 0;
     /* Unmap base view */
-    if (g_memory_base) {
-        UnmapViewOfFile(g_memory_base);
-        g_memory_base = NULL;
-        g_memory_size = 0;
-    }
+    if (!release_layout_view(&g_memory_base, "base RAM view")) released = 0;
     /* The apertures. Left mapped, a second init cannot place them: the first
      * run still owns 0x80000000, 0xFD000000, 0xFE800000, 0xFF000000 and the
      * tiled alias, and every one of those comes back as "failed" while init
      * still returns TRUE because they are best-effort. The result is a layout
      * that looks initialised and has no device apertures at all. */
-    if (g_tiled_view) {
-        UnmapViewOfFile(g_tiled_view);
-        g_tiled_view = NULL;
-    }
+    if (!release_layout_view(&g_tiled_view, "tiled aperture")) released = 0;
     if (g_contig_memory) {
-        if(g_contig_mapping)UnmapViewOfFile(g_contig_memory);
-        else VirtualFree(g_contig_memory, 0, MEM_RELEASE);
-        g_contig_memory = NULL;
+        if (g_contig_mapping) {
+            if (!release_layout_view(&g_contig_memory, "contiguous aperture")) released = 0;
+        } else if (!release_layout_memory(&g_contig_memory, "contiguous aperture")) released = 0;
     }
-    if(g_contig_mapping){CloseHandle(g_contig_mapping);g_contig_mapping=NULL;}
-    if (g_mcpx_memory) {
-        VirtualFree(g_mcpx_memory, 0, MEM_RELEASE);
-        g_mcpx_memory = NULL;
+    if (!g_contig_memory && !close_layout_mapping(&g_contig_mapping, "contiguous mapping"))
+        released = 0;
+    if (g_ac97_veh) {
+        if (RemoveVectoredExceptionHandler(g_ac97_veh)) g_ac97_veh = NULL;
+        else {
+            fprintf(stderr, "  Could not remove AC97 fault handler\n");
+            released = 0;
+        }
     }
-    if (g_flash_memory) {
-        VirtualFree(g_flash_memory, 0, MEM_RELEASE);
-        g_flash_memory = NULL;
-    }
+    g_ac97_page = NULL;
+#if defined(_WIN32)
+    if (!release_layout_memory(&g_mcpx_memory, "MCPX aperture")) released = 0;
+#else
+    if (!release_layout_view(&g_mcpx_memory, "MCPX aperture")) released = 0;
+#endif
+    if (!g_mcpx_memory) g_mcpx_regs = NULL;
+#if !defined(_WIN32)
+    if (!release_layout_view(&g_mcpx_alias, "MCPX host alias")) released = 0;
+    if (!g_mcpx_memory && !g_mcpx_alias &&
+        !close_layout_mapping(&g_mcpx_mapping, "MCPX mapping")) released = 0;
+#endif
+    if (!release_layout_memory(&g_flash_memory, "flash aperture")) released = 0;
 
-    /* Close file mapping handle */
-    if (g_mapping_handle) {
-        CloseHandle(g_mapping_handle);
-        g_mapping_handle = NULL;
-    }
+    int ram_views_gone = !g_memory_base;
+    for (int m = 0; m < XBOX_NUM_MIRRORS; m++)
+        if (g_mirror_views[m]) ram_views_gone = 0;
+    if (ram_views_gone && !close_layout_mapping(&g_mapping_handle, "RAM mapping"))
+        released = 0;
 
-    guest_vmem_shutdown();
+    if (!guest_vmem_shutdown()) released = 0;
 
     /* Whatever is left of the base+mirrors reservation. The views carved out
      * of it are already unmapped above; this releases the range itself. */
     if (g_span_base) {
-        VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
-        g_span_base = NULL;
-        g_span_size = 0;
+#if !defined(_WIN32)
+        int span_released = 1;
+        for (unsigned i = 0; i <= XBOX_NUM_MIRRORS; ++i)
+            if (!release_span_slice(i)) span_released = 0;
+        if (span_released) {
+            g_span_base = NULL;
+            g_span_size = g_span_stride = 0;
+        } else released = 0;
+#else
+        if (release_layout_memory(&g_span_base, "guest reservation"))
+            g_span_size = 0;
+        else released = 0;
+#endif
     }
+    if (!released) {
+        s_cleanup_incomplete = 1;
+        fprintf(stderr, "xbox_MemoryLayoutShutdown: incomplete; retain state and retry\n");
+        return FALSE;
+    }
+    g_memory_size = 0;
+    g_span_size = 0;
+    g_memory_offset = 0;
+    g_xbox_mem_offset = 0;
+    g_apu_mmio_trapped = 0;
+    g_xbox_image_lo = g_xbox_image_hi = 0;
+    g_xbox_code_lo = g_xbox_code_hi = 0;
+    free(g_tls_template);
+    g_tls_template = NULL;
+    memset(g_tib_template, 0, sizeof(g_tib_template));
+    g_tls_total = 0;
+    g_tls_thread_size = 64;
+    g_dsp_ack_count = g_fence_mirror_count = g_counter_mirror_count = 0;
+    g_frame_counter_count = 0;
+    s_fb_va = s_fb_pitch = 0;
+    s_fb_height = 480;
+    reset_layout_allocators();
+    s_layout_failed = 0;
+#if !defined(_WIN32)
+    g_mcpx_host_page = 0;
+#endif
+    s_cleanup_incomplete = 0;
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
+    return TRUE;
+}
+
+void xbox_MemoryLayoutShutdown(void)
+{
+    (void)xbox_MemoryLayoutShutdownChecked();
 }
 
 /* Bump allocator for pure address-space reservations, above RAM.
@@ -3070,6 +3444,28 @@ BOOL xbox_IsXboxAddress(uintptr_t address)
 {
     return (address >= XBOX_BASE_ADDRESS &&
             address < XBOX_BASE_ADDRESS + g_memory_size);
+}
+
+void *xbox_TranslateMappedRam(uint32_t address, size_t bytes)
+{
+    if (!bytes || bytes > UINT64_C(0x100000000) - address) return NULL;
+    uint64_t end = (uint64_t)address + bytes;
+    if (g_memory_base && end <= g_memory_size)
+        return (char *)g_memory_base + address;
+    if (g_contig_memory && address >= XBOX_CONTIG_BASE &&
+        end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return (char *)g_contig_memory + (address - XBOX_CONTIG_BASE);
+    size_t tiled_size = xbox_TiledApertureSize();
+    if (tiled_size > XBOX_CONTIG_SIZE) tiled_size = XBOX_CONTIG_SIZE;
+    if (g_tiled_view && address >= XBOX_TILED_BASE &&
+        end <= (uint64_t)XBOX_TILED_BASE + tiled_size)
+        return (char *)g_tiled_view + (address - XBOX_TILED_BASE);
+    for (unsigned i = 0; i < XBOX_NUM_MIRRORS; ++i) {
+        uint64_t start = (uint64_t)(i + 1) * g_memory_size;
+        if (g_mirror_views[i] && address >= start && end <= start + g_memory_size)
+            return (char *)g_mirror_views[i] + (size_t)(address - start);
+    }
+    return NULL;
 }
 
 void *xbox_GetMemoryBase(void)
@@ -3149,6 +3545,7 @@ static int heap_insert_free(int at, uint32_t addr, uint32_t size)
  * keeps the holes (and the table) from piling up. Caller holds g_heap_lock.
  * RECOMP_HEAP_CHECK=1 cross-checks every lookup against the old linear scan. */
 static int g_heap_hole_hint = 0;   /* upper bound on size-0 slots since the last compaction */
+static int g_heap_stack_seeded;
 
 /* Index of the non-hole block with the greatest addr <= va, or -1. */
 static int heap_floor_index(uint32_t va)
@@ -3246,12 +3643,11 @@ int xbox_worker_stack_limit(void)
  * stack, so no coalescing reaches across either boundary. */
 static void heap_seed_stack_gap(void)
 {
-    static int seeded;
     uint32_t lo = XBOX_WORKER_STACK_BASE + XBOX_WORKER_STACK_LIMIT * XBOX_WORKER_STACK_SIZE;
     uint32_t hi = XBOX_STACK_BASE + XBOX_STACK_SIZE - XBOX_MAIN_STACK_RESERVE;
-    if (seeded)
+    if (g_heap_stack_seeded)
         return;
-    seeded = 1;
+    g_heap_stack_seeded = 1;
     if (!xbox_StackReclaimEnabled() || hi <= lo)
         return;
     if (heap_insert_free(0, lo, hi - lo))
@@ -3324,6 +3720,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 #define XBOX_MAX_THREAD_STACKS  8
 
 static int g_thread_stacks_used = 0;
+static SRWLOCK g_thread_stacks_lock = SRWLOCK_INIT;
 
 /* A TIB and TLS block for a newly spawned guest thread.
  *
@@ -3349,25 +3746,24 @@ uint32_t xbox_AllocThreadTib(void)
     const uint32_t tib_size = 0x40;
     uint32_t tib, block, thread_data, total;
 
-    if (!g_tls_total)
-        return 0;                    /* image has no TLS; nothing to copy */
-
+    if (!g_memory_base)
+        return 0;
     total = g_tls_total;
-    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size, 16);
+    tib = xbox_HeapAlloc(tib_size + (total ? total + g_tls_thread_size : 0), 16);
     if (!tib)
         return 0;
-    block       = tib + tib_size;
-    thread_data = block + total;
 
-    /* The TIB itself, copied so stack bounds and the fields the title filled
-     * in are inherited, then the two that must not be. */
-    memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), tib_size);
-    memcpy(TIB_VA(block), TIB_VA(g_tls_template_va), total);
-    memset(TIB_VA(thread_data), 0, g_tls_thread_size);
-
+    memcpy(TIB_VA(tib), g_tib_template, tib_size);
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
-    *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
-    *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+    *(uint32_t *)TIB_VA(tib + 0x18) = tib;            /* own TIB pointer  */
+    if (total) {
+        block       = tib + tib_size;
+        thread_data = block + total;
+        memcpy(TIB_VA(block), g_tls_template, total);
+        memset(TIB_VA(thread_data), 0, g_tls_thread_size);
+        *(uint32_t *)TIB_VA(block)      = thread_data;
+        *(uint32_t *)TIB_VA(tib + 0x04) = block + total;
+    }
 
     return tib;
     #undef TIB_VA
@@ -3377,7 +3773,9 @@ uint32_t xbox_AllocThreadStack(void)
 {
     uint32_t base;
 
+    AcquireSRWLockExclusive(&g_thread_stacks_lock);
     if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
+        ReleaseSRWLockExclusive(&g_thread_stacks_lock);
         return 0;
     }
 
@@ -3396,9 +3794,12 @@ uint32_t xbox_AllocThreadStack(void)
      * for small ones.
      */
     base = xbox_HeapAlloc(XBOX_THREAD_STACK_SIZE, 4096);
-    if (!base)
+    if (!base) {
+        ReleaseSRWLockExclusive(&g_thread_stacks_lock);
         return 0;
+    }
     g_thread_stacks_used++;
+    ReleaseSRWLockExclusive(&g_thread_stacks_lock);
 
     /* Top of the slice, 16-byte aligned, growing down. */
     return base + XBOX_THREAD_STACK_SIZE - 16;
@@ -3422,9 +3823,11 @@ void xbox_FreeThreadStack(uint32_t stack_top)
 {
     if (!stack_top)
         return;
+    AcquireSRWLockExclusive(&g_thread_stacks_lock);
     xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
     if (g_thread_stacks_used > 0)
         g_thread_stacks_used--;
+    ReleaseSRWLockExclusive(&g_thread_stacks_lock);
 }
 
 /* Bump allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
@@ -3470,6 +3873,27 @@ static struct { uint32_t addr, size; int free; } g_contig_blocks[CONTIG_MAX_BLOC
 static int g_contig_block_count;
 static SRWLOCK g_contig_lock = SRWLOCK_INIT;
 
+static uint32_t contig_allocation_granularity(void)
+{
+#if !defined(_WIN32)
+    long page = sysconf(_SC_PAGESIZE);
+    if (page > 4096 && page <= 65536 && (page & (page - 1)) == 0)
+        return (uint32_t)page;
+#endif
+    return 4096;
+}
+
+/* Shutdown is called only after every guest/device worker has stopped. */
+static void reset_layout_allocators(void)
+{
+    g_reserve_next = 0;
+    g_heap_next = XBOX_HEAP_BASE;
+    g_heap_alloc_count = g_heap_block_count = g_heap_hole_hint = 0;
+    g_heap_stack_seeded = g_thread_stacks_used = 0;
+    g_contig_next = XBOX_CONTIG_BASE + 0x1000u;
+    g_contig_block_count = 0;
+}
+
 static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
 {
     if (g_contig_block_count >= CONTIG_MAX_BLOCKS || size == 0)
@@ -3486,11 +3910,19 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t requested=size;
     uint32_t result = 0;
+    uint32_t granularity = contig_allocation_granularity();
     int reclaim = xbox_HeapReclaimEnabled();
     int i;
 
     if(!size || size>XBOX_CONTIG_SIZE || (alignment && (alignment&(alignment-1))))return 0;
-    if (alignment < 4096) alignment = 4096;
+    if (alignment < granularity) alignment = granularity;
+    if (granularity > 4096) {
+        if (size > UINT32_MAX - (granularity - 1))
+            return 0;
+        size = (size + granularity - 1) & ~(granularity - 1);
+        if (size > XBOX_CONTIG_SIZE)
+            return 0;
+    }
     if (reclaim) {
         AcquireSRWLockExclusive(&g_contig_lock);
         size = (size + 4095u) & ~4095u;
@@ -3548,7 +3980,8 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
      * GPU allocation must become writable before its pages are zeroed/reused. */
     DWORD old_protect;
     if(!VirtualProtect((void *)((uintptr_t)result+g_memory_offset),size,PAGE_READWRITE,&old_protect)) {
-        fprintf(stderr,"[CONTIG] cannot reset allocated pages %08X+%u: %lu\n",result,size,GetLastError());
+        fprintf(stderr,"[CONTIG] cannot reset allocated pages %08X+%u: %lu\n",
+                result,size,(unsigned long)GetLastError());
         xbox_ContiguousFree(result);
         return 0;
     }
@@ -3558,7 +3991,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
         MEMORY_BASIC_INFORMATION region;
         VirtualQuery((void *)((uintptr_t)result+g_memory_offset),&region,sizeof(region));
         fprintf(stderr,"[CONTIG-ALLOC] request=%u rounded=%u alignment=%u -> %08X protect=%lX esp=%08X\n",
-            requested,size,alignment,result,region.Protect,g_esp);
+            requested,size,alignment,result,(unsigned long)region.Protect,g_esp);
         fflush(stderr);
     }
     nv2a_gpu_memory_reallocated((void *)((uintptr_t)result+g_memory_offset),size);

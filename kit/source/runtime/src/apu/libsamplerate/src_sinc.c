@@ -592,6 +592,8 @@ calc_output_stereo (SINC_FILTER *filter, int channels, increment_t increment, in
  *    every sum sees exactly the scalar sequence of additions; only independent chains overlap;
  *  - icoeff is the same C expression (float subtract, then double); no FMA (no /arch, /fp:precise).
  * The final (float)(scale * (left + right)) is the same per channel. */
+#if defined(_WIN32) && (defined(_M_X64) || defined(_M_IX86))
+#define MA2_SINC_SSE2 1
 #include <emmintrin.h>
 #include <intrin.h>
 
@@ -762,6 +764,7 @@ sinc_wrap (long x, int len)
 {	while (x >= len) x -= len ;
 	return (int) x ;
 }
+#endif /* MA2_SINC_SSE2 */
 
 static SRC_ERROR
 sinc_stereo_vari_process_ref (SRC_STATE *state, SRC_DATA *data)
@@ -855,6 +858,7 @@ sinc_stereo_vari_process_ref (SRC_STATE *state, SRC_DATA *data)
 	return SRC_ERR_NO_ERROR ;
 } /* sinc_stereo_vari_process_ref */
 
+#if defined(MA2_SINC_SSE2)
 static SRC_ERROR
 sinc_stereo_vari_process_fast (SRC_STATE *state, SRC_DATA *data)
 {	SINC_FILTER *filter ;
@@ -1003,6 +1007,31 @@ sinc_stereo_vari_process (SRC_STATE *state, SRC_DATA *data)
 	free (out2) ;
 	return e1 ;
 } /* sinc_stereo_vari_process */
+#else
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+void
+apu_sinc_verify_report (void)
+{	/* The reference kernel is the only implementation on this host. */
+}
+
+SRC_ERROR
+sinc_stereo_vari_process (SRC_STATE *state, SRC_DATA *data)
+{	static volatile long reported ;
+#if defined(_MSC_VER)
+	int first = !_InterlockedExchange (&reported, 1) ;
+#else
+	int first = !__atomic_exchange_n (&reported, 1, __ATOMIC_RELAXED) ;
+#endif
+	if (first)
+	{	const char *mode = getenv ("RECOMP_APU_SRC") ;
+		if (mode && *mode && strcmp (mode, "ref") && strcmp (mode, "0"))
+			fprintf (stderr, "[APU-SRC] %s unavailable on this host; using scalar reference\n", mode) ;
+		} ;
+	return sinc_stereo_vari_process_ref (state, data) ;
+}
+#endif
 
 static inline void
 calc_output_quad (SINC_FILTER *filter, int channels, increment_t increment, increment_t start_filter_index, double scale, float * output)

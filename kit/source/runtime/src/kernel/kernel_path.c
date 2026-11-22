@@ -45,6 +45,74 @@ static int match_path_rule(const char *path, const char *prefix)
     return length;
 }
 
+#define XBOX_PART_TABLE_OFFSET 0x800
+#define XBOX_PART_IN_USE       0x80000000u
+#define XBOX_PARTITION_COUNT   6
+
+static const uint64_t s_xbox_partition_sectors[XBOX_PARTITION_COUNT] = {
+    0,             /* 0: whole disk, partition table only */
+    0x00465400ull, /* 1: E: game and saves                */
+    0x000FA000ull, /* 2: C: system                        */
+    0x00177000ull, /* 3: X: cache                         */
+    0x00177000ull, /* 4: Y: cache                         */
+    0x00177000ull, /* 5: Z: cache                         */
+};
+
+static int xbox_partition_device_number(const char *xbox_path)
+{
+    static const char *prefix = "\\Device\\Harddisk0\\Partition";
+    int length = match_prefix(xbox_path, prefix);
+    const char *rest;
+    int partition;
+
+    if (!length)
+        return -1;
+
+    partition = xbox_path[length] - '0';
+    if (partition < 0 || partition > 9)
+        return -1;
+
+    rest = xbox_path + length + 1;
+    if (*rest == '\\' || *rest == '/')
+        rest++;
+    return *rest == '\0' ? partition : -1;
+}
+
+static void xbox_store_le32(unsigned char *out, uint32_t value)
+{
+    out[0] = (unsigned char)value;
+    out[1] = (unsigned char)(value >> 8);
+    out[2] = (unsigned char)(value >> 16);
+    out[3] = (unsigned char)(value >> 24);
+}
+
+static void xbox_build_partition_table(unsigned char sector[512])
+{
+    static const struct {
+        const char *name;
+        uint32_t start;
+        uint32_t size;
+    } parts[] = {
+        { "XBOX_PART_X", 0x00000400, 0x00177000 },
+        { "XBOX_PART_Y", 0x00177400, 0x00177000 },
+        { "XBOX_PART_Z", 0x002EE400, 0x00177000 },
+        { "XBOX_PART_C", 0x00465400, 0x000FA000 },
+        { "XBOX_PART_E", 0x0055F400, 0x00465400 },
+    };
+
+    memset(sector, 0, 512);
+    memcpy(sector, "****PARTINFO****", 16);
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        unsigned char *entry = sector + 48 + i * 32;
+        size_t name_length = strlen(parts[i].name);
+        memset(entry, ' ', 16);
+        memcpy(entry, parts[i].name, name_length < 16 ? name_length : 16);
+        xbox_store_le32(entry + 16, XBOX_PART_IN_USE);
+        xbox_store_le32(entry + 20, parts[i].start);
+        xbox_store_le32(entry + 24, parts[i].size);
+    }
+}
+
 /* A device-path translation rule, shared by both backends. */
 typedef struct {
     const char* prefix;     /* Xbox path prefix (backslash form)         */
@@ -166,7 +234,19 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
         if (match_path_rule(out, s_rules[i].prefix))
             return 1;           /* the target is somewhere we can place */
     }
+    if (xbox_partition_device_number(out) >= 0)
+        return 1;
     return 0;
+}
+
+BOOL xbox_path_is_partition_device(const char *xbox_path)
+{
+    char linked[512];
+    if (!xbox_path)
+        return FALSE;
+    if (resolve_symlink(xbox_path, linked, sizeof(linked)))
+        xbox_path = linked;
+    return xbox_partition_device_number(xbox_path) >= 0;
 }
 
 /* ======================================================================== */
@@ -204,42 +284,20 @@ static BOOL  s_initialized = FALSE;
  * has to be there, not fabricating anything the title owns.
  */
 #define XBOX_DISK_IMAGE_NAME   L"Partition0.img"
-#define XBOX_PART_TABLE_OFFSET 0x800
-#define XBOX_PART_IN_USE       0x80000000u
 
 static void xbox_write_partition_table(const WCHAR *path)
 {
-    /* name[16], flags, lba_start, lba_size, reserved -- 32 bytes each */
-    static const struct { const char *name; ULONG start, size; } parts[] = {
-        { "XBOX_PART_X",  0x00000400, 0x00177000 },  /* X: cache      */
-        { "XBOX_PART_Y",  0x00177400, 0x00177000 },  /* Y: cache      */
-        { "XBOX_PART_Z",  0x002EE400, 0x00177000 },  /* Z: cache      */
-        { "XBOX_PART_C",  0x00465400, 0x000FA000 },  /* C: system     */
-        { "XBOX_PART_E",  0x0055F400, 0x00465400 },  /* E: game/save  */
-    };
     unsigned char sector[512];
     HANDLE h;
     DWORD written;
     LARGE_INTEGER off;
-    size_t i;
 
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
                     OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE)
         return;
 
-    memset(sector, 0, sizeof(sector));
-    memcpy(sector, "****PARTINFO****", 16);
-    for (i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
-        unsigned char *e = sector + 48 + i * 32;   /* 16 magic + 32 reserved */
-        size_t n = strlen(parts[i].name);
-        memset(e, ' ', 16);
-        memcpy(e, parts[i].name, n < 16 ? n : 16);
-        *(ULONG *)(e + 16) = XBOX_PART_IN_USE;
-        *(ULONG *)(e + 20) = parts[i].start;
-        *(ULONG *)(e + 24) = parts[i].size;
-        *(ULONG *)(e + 28) = 0;
-    }
+    xbox_build_partition_table(sector);
 
     off.QuadPart = XBOX_PART_TABLE_OFFSET;
     if (SetFilePointerEx(h, off, NULL, FILE_BEGIN))
@@ -261,38 +319,12 @@ static void xbox_write_partition_table(const WCHAR *path)
  */
 static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD n)
 {
-    static const char *prefix = "\\Device\\Harddisk0\\Partition";
-    int len = match_prefix(xbox_path, prefix);
-    int digit;
-    const char *rest;
-
-    if (!len)
-        return FALSE;
-    digit = xbox_path[len];
-    if (digit < '0' || digit > '9')
+    int partition = xbox_partition_device_number(xbox_path);
+    if (partition < 0)
         return FALSE;
 
-    rest = xbox_path + len + 1;
-    /* Nothing below it, allowing for a single trailing separator. */
-    if (*rest == '\\' || *rest == '/')
-        rest++;
-    if (*rest != '\0')
-        return FALSE;
-
-    swprintf_s(out, n, L"%s\\Partition%c.img", s_save_dir, (WCHAR)digit);
+    swprintf_s(out, n, L"%s\\Partition%d.img", s_save_dir, partition);
     return TRUE;
-}
-
-BOOL xbox_path_is_partition_device(const char *xbox_path)
-{
-    char linked[512];
-    WCHAR host[MAX_PATH];
-    if (!xbox_path) return FALSE;
-    /* The cache queries a mounted drive such as X:\\, while CRT startup uses
-     * the explicit device path. Apply the same mount and root matching as
-     * translation; files beneath the root must never become volume handles. */
-    if (resolve_symlink(xbox_path, linked, sizeof(linked))) xbox_path=linked;
-    return xbox_partition_device_path(xbox_path,host,MAX_PATH);
 }
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
@@ -370,14 +402,6 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
          * first: the cache partitions are 750 MB each and none of that is
          * touched until something writes to it. */
         {
-            static const ULONGLONG part_sectors[6] = {
-                0,             /* 0: whole disk, sized below      */
-                0x00465400ull, /* 1: E: game and saves            */
-                0x000FA000ull, /* 2: C: system                    */
-                0x00177000ull, /* 3: X: cache                     */
-                0x00177000ull, /* 4: Y: cache                     */
-                0x00177000ull, /* 5: Z: cache                     */
-            };
             for (int p = 1; p <= 5; p++) {
                 HANDLE h;
                 DWORD ret;
@@ -391,7 +415,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
                     continue;
                 DeviceIoControl(h, FSCTL_SET_SPARSE, NULL, 0, NULL, 0,
                                 &ret, NULL);
-                end.QuadPart = (LONGLONG)(part_sectors[p] * 512ull);
+                end.QuadPart = (LONGLONG)(s_xbox_partition_sectors[p] * 512ull);
                 if (SetFilePointerEx(h, end, NULL, FILE_BEGIN))
                     SetEndOfFile(h);
                 CloseHandle(h);
@@ -545,11 +569,13 @@ void xbox_overlay_read_path(WCHAR *path,DWORD capacity)
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
 #include <errno.h>
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
 static BOOL s_initialized = FALSE;
+static BOOL s_partition_ready[XBOX_PARTITION_COUNT];
 
 /* Strip a single trailing '/' (but never the root '/'). */
 static void strip_trailing_slash(char* s)
@@ -578,6 +604,101 @@ static void mkdir_p(const char* path)
     }
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
+}
+
+static int xbox_partition_image_path(int partition, char *out, size_t out_size)
+{
+    int length = snprintf(out, out_size, "%s/Partition%d.img",
+                          s_save_dir, partition);
+    return length > 0 && (size_t)length < out_size;
+}
+
+static int xbox_open_private_partition(const char *path)
+{
+    struct stat status;
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_PATH,
+                 "open partition image: %s", strerror(errno));
+        return -1;
+    }
+    if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) ||
+        status.st_uid != geteuid() || status.st_nlink != 1) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_PATH,
+                 "partition image is not a private regular file");
+        close(fd);
+        return -1;
+    }
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_PATH,
+                 "secure partition image: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int xbox_write_all_at(int fd, const void *data, size_t size, off_t offset)
+{
+    const unsigned char *bytes = (const unsigned char *)data;
+    size_t written = 0;
+    while (written < size) {
+        ssize_t count = pwrite(fd, bytes + written, size - written,
+                               offset + (off_t)written);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0) {
+            if (count == 0)
+                errno = EIO;
+            return 0;
+        }
+        written += (size_t)count;
+    }
+    return 1;
+}
+
+static void xbox_prepare_partition_images(void)
+{
+    unsigned char table[512];
+    char path[MAX_PATH];
+
+    memset(s_partition_ready, 0, sizeof(s_partition_ready));
+    mkdir_p(s_save_dir);
+    xbox_build_partition_table(table);
+
+    for (int partition = 0; partition < XBOX_PARTITION_COUNT; partition++) {
+        if (!xbox_partition_image_path(partition, path, sizeof(path))) {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_PATH,
+                     "partition image path is too long");
+            continue;
+        }
+
+        int fd = xbox_open_private_partition(path);
+        if (fd < 0)
+            continue;
+
+        int valid;
+        if (partition == 0) {
+            valid = xbox_write_all_at(fd, table, sizeof(table),
+                                      XBOX_PART_TABLE_OFFSET);
+        } else {
+            off_t size = (off_t)(s_xbox_partition_sectors[partition] * 512ull);
+            valid = ftruncate(fd, size) == 0;
+        }
+
+        if (!valid) {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_PATH,
+                     "initialize partition image: %s", strerror(errno));
+            if (close(fd) != 0)
+                xbox_log(XBOX_LOG_ERROR, XBOX_LOG_PATH,
+                         "close partition image: %s", strerror(errno));
+        } else if (close(fd) == 0) {
+            s_partition_ready[partition] = TRUE;
+        } else {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_PATH,
+                     "close partition image: %s", strerror(errno));
+        }
+    }
 }
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
@@ -609,6 +730,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     strip_trailing_slash(s_game_dir);
     strip_trailing_slash(s_save_dir);
 
+    xbox_prepare_partition_images();
+
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
              s_game_dir, s_save_dir);
@@ -631,6 +754,25 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         char linked[512];
         if (resolve_symlink(xbox_path, linked, sizeof(linked)))
             return xbox_translate_path(linked, host_path_buf, buf_size);
+    }
+
+    {
+        int partition = xbox_partition_device_number(xbox_path);
+        if (partition >= 0) {
+            if (partition >= XBOX_PARTITION_COUNT ||
+                !s_partition_ready[partition]) {
+                xbox_log(XBOX_LOG_ERROR, XBOX_LOG_PATH,
+                         "partition device is unavailable");
+                return FALSE;
+            }
+            if (!xbox_partition_image_path(partition, host_path_buf, buf_size)) {
+                xbox_log(XBOX_LOG_ERROR, XBOX_LOG_PATH,
+                         "partition image path is too long");
+                return FALSE;
+            }
+            XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
+            return TRUE;
+        }
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {

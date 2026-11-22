@@ -8,14 +8,9 @@
  * HcRevision out of an aperture backed by zeroed RAM, concludes there is a
  * host controller with no root hub ports, and enumerates nothing.
  *
- * This is the register half of the answer: a controller that reports a real
- * revision, a root hub with ports, and the handful of registers that have
- * behaviour rather than storage. It does not yet walk the endpoint and
- * transfer descriptor lists, which is what actually moves a report, so a
- * driver that gets this far will find a port and then have nothing to talk to.
- * That is deliberate -- the register trace is what says whether the driver
- * polls HcInterruptStatus or waits on the IRQ, and that answers how much of
- * the rest is needed before any of it is written.
+ * The models provide register behaviour and a worker that walks endpoint and
+ * transfer descriptors to deliver the emulated gamepad's reports. They are
+ * not a complete implementation of every OHCI or USB device.
  *
  * Written from the OHCI 1.0a specification and this title's own code.
  */
@@ -31,15 +26,34 @@
 
 /* Bring the models up. Safe to call more than once; does nothing unless
  * RECOMP_USB is set, so a title that was working without a controller keeps
- * behaving exactly as it did. */
+ * behaving exactly as it did. POSIX AArch64 requires an attached MMIO broker
+ * before Init; check IsEnabled before allowing guest execution. */
 void xbox_OhciInit(void);
+
+/* Inspect after Init and before starting guest work. False means either that
+ * RECOMP_USB is disabled or initialization failed; call Shutdown after a
+ * failed initialization to release any retained traps. */
+int xbox_OhciIsEnabled(void);
+
+/* Stop the worker and restore its pages before releasing the memory layout.
+ * On POSIX AArch64, seal registrations and stop/join all fault producers
+ * first. Returns 0 if producers remain, the worker cannot be stopped, or a
+ * page cannot be restored; retain guest memory and retry in that case. */
+int xbox_OhciShutdown(void);
 
 /* 1 if the address is inside a controller this model owns. */
 int  xbox_OhciOwnsAddress(uint32_t xbox_va);
 
 /* Service a trapped access. Returns 1 if the faulting instruction was decoded
- * and stepped over. `ctx` is a PCONTEXT; void * keeps windows.h out of here. */
+ * and stepped over. `ctx` is a Windows CONTEXT or a POSIX ucontext_t. */
 int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
+
+#if defined(__aarch64__) && !defined(_WIN32)
+/* Broker thread only; the fault and complete range are validated first. */
+struct XboxPosixMmioRequest;
+int xbox_OhciPosixSameOwner(uint32_t first_va, uint32_t second_va);
+int xbox_OhciPosixRequest(uint32_t fault_va, struct XboxPosixMmioRequest *request);
+#endif
 
 /* Report counts at exit, so a run says whether the driver ever looked. */
 void xbox_OhciReport(void);

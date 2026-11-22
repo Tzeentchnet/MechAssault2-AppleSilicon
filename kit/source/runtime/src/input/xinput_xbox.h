@@ -87,6 +87,12 @@ typedef struct XBOX_INPUT_CAPABILITIES {
  * Maps Xbox controller ports to XInput slots.
  */
 void xbox_InputInit(void);
+#if !defined(_WIN32)
+/* The window's main thread pumps SDL events while this flag is set. */
+void xbox_InputSetMainPump(int on);
+/* Stop and join guest/input workers before shutting the input layer down. */
+void xbox_InputShutdown(void);
+#endif
 
 /**
  * Get the state of a controller.
@@ -105,7 +111,6 @@ BOOL xbox_InputReadMouseAxes(float *x, float *y, double elapsed_seconds);
  * Set controller vibration.
  */
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
-#if defined(_WIN32)
 /* Stop our active motors when the game loses focus or closes. */
 /* Suppress these guest ports through pause and authored stop completion.
  * Zero releases the gate without replay; existing focus/capture still apply. */
@@ -113,7 +118,6 @@ void xbox_InputFeedbackPaused(unsigned blocked_ports);
 void xbox_InputFeedbackFocus(BOOL focused);
 /* W-10: tap START to pause when the window loses focus during play (no-op in menus and movies). */
 void xbox_InputPauseTap(const char *why);
-#endif
 
 /**
  * Check if a controller is connected.

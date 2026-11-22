@@ -1004,9 +1004,71 @@ static NTSTATUS errno_to_status(int e)
         case EACCES:
         case EPERM:   return STATUS_ACCESS_DENIED;
         case EEXIST:  return STATUS_OBJECT_NAME_COLLISION;
+        case EBADF:   return STATUS_INVALID_HANDLE;
+        case EINVAL:  return STATUS_INVALID_PARAMETER;
+        case ENOSPC:
+#ifdef EDQUOT
+        case EDQUOT:
+#endif
+            return STATUS_DISK_FULL;
         case ENOMEM:  return STATUS_NO_MEMORY;
         default:      return STATUS_UNSUCCESSFUL;
     }
+}
+
+static int reserve_file_space(int fd, off_t size)
+{
+    if (size <= 0)
+        return 0;
+
+#if defined(__APPLE__) && defined(F_PREALLOCATE)
+    fstore_t store = {
+        .fst_flags = F_ALLOCATECONTIG,
+        .fst_posmode = F_PEOFPOSMODE,
+        .fst_offset = 0,
+        .fst_length = size,
+    };
+    if (fcntl(fd, F_PREALLOCATE, &store) == 0)
+        return 0;
+    store.fst_flags = F_ALLOCATEALL;
+    if (fcntl(fd, F_PREALLOCATE, &store) == 0)
+        return 0;
+    if (errno != EINVAL && errno != ENOTSUP
+#ifdef EOPNOTSUPP
+        && errno != EOPNOTSUPP
+#endif
+    )
+        return -1;
+#elif defined(FALLOC_FL_KEEP_SIZE)
+    if (fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, size) == 0)
+        return 0;
+    if (errno != EINVAL && errno != ENOSYS && errno != ENOTSUP
+#ifdef EOPNOTSUPP
+        && errno != EOPNOTSUPP
+#endif
+    )
+        return -1;
+#endif
+
+    struct stat status;
+    if (fstat(fd, &status) != 0)
+        return -1;
+#if defined(__APPLE__)
+    if (status.st_size >= size)
+        return 0;
+    if (ftruncate(fd, size) != 0)
+        return -1;
+    return ftruncate(fd, status.st_size);
+#else
+    int error = posix_fallocate(fd, 0, size);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    if (status.st_size < size && ftruncate(fd, status.st_size) != 0)
+        return -1;
+    return 0;
+#endif
 }
 
 NTSTATUS __stdcall xbox_NtCreateFile(
@@ -1025,6 +1087,20 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+
+    if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        xbox_path_is_partition_device(xbox_path)) {
+        struct stat status;
+        if (lstat(host_path, &status) == 0 && S_ISREG(status.st_mode)) {
+            char *slash = strrchr(host_path, '/');
+            if (slash && slash != host_path) {
+                *slash = '\0';
+                xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                         "NtCreateFile: directory open of a device image, "
+                         "using its containing directory instead");
+            }
+        }
     }
 
     int fd;
@@ -1127,6 +1203,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_dir_context_drop(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1219,7 +1296,6 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
 {
-    (void)Length;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -1228,6 +1304,61 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         return STATUS_INVALID_HANDLE;
 
     switch (FileInformationClass) {
+        case XboxFileRenameInformation: {
+            PXBOX_FILE_RENAME_INFORMATION info =
+                (PXBOX_FILE_RENAME_INFORMATION)FileInformation;
+            char xbox_path[MAX_PATH];
+            char destination[MAX_PATH];
+            const char *source = w32_handle_path(FileHandle);
+            struct stat existing;
+
+            if (Length < sizeof(*info) || !info->FileName.Buffer ||
+                !info->FileName.Length ||
+                info->FileName.Length >= sizeof(xbox_path)) {
+                IoStatusBlock->Status = STATUS_INVALID_PARAMETER;
+                IoStatusBlock->Information = 0;
+                return STATUS_INVALID_PARAMETER;
+            }
+            memcpy(xbox_path, info->FileName.Buffer, info->FileName.Length);
+            xbox_path[info->FileName.Length] = '\0';
+            if (info->RootDirectory) {
+                const char *root = w32_handle_path(info->RootDirectory);
+                int length;
+                for (char *p = xbox_path; *p; p++)
+                    if (*p == '\\') *p = '/';
+                length = root ? snprintf(destination, sizeof(destination),
+                                         "%s/%s", root, xbox_path) : -1;
+                if (length <= 0 || (size_t)length >= sizeof(destination)) {
+                    IoStatusBlock->Status = STATUS_OBJECT_PATH_NOT_FOUND;
+                    IoStatusBlock->Information = 0;
+                    return STATUS_OBJECT_PATH_NOT_FOUND;
+                }
+            } else if (!xbox_translate_path(
+                           xbox_path, destination, sizeof(destination))) {
+                IoStatusBlock->Status = STATUS_OBJECT_PATH_NOT_FOUND;
+                IoStatusBlock->Information = 0;
+                return STATUS_OBJECT_PATH_NOT_FOUND;
+            }
+            if (!source) {
+                IoStatusBlock->Status = STATUS_INVALID_HANDLE;
+                IoStatusBlock->Information = 0;
+                return STATUS_INVALID_HANDLE;
+            }
+            if (!info->ReplaceIfExists && lstat(destination, &existing) == 0) {
+                IoStatusBlock->Status = STATUS_OBJECT_NAME_COLLISION;
+                IoStatusBlock->Information = 0;
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+            if (rename(source, destination) != 0) {
+                NTSTATUS status = errno_to_status(errno);
+                IoStatusBlock->Status = status;
+                IoStatusBlock->Information = 0;
+                return status;
+            }
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = 0;
+            return STATUS_SUCCESS;
+        }
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
             if (lseek(fd, (off_t)info->CurrentByteOffset.QuadPart, SEEK_SET) < 0)
@@ -1240,6 +1371,24 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
+        case XboxFileAllocationInformation: {
+            PXBOX_FILE_END_OF_FILE_INFORMATION info =
+                (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            if (Length < sizeof(*info) || info->EndOfFile.QuadPart < 0) {
+                IoStatusBlock->Status = STATUS_INVALID_PARAMETER;
+                IoStatusBlock->Information = 0;
+                return STATUS_INVALID_PARAMETER;
+            }
+            if (reserve_file_space(fd, (off_t)info->EndOfFile.QuadPart) != 0) {
+                NTSTATUS status = errno_to_status(errno);
+                IoStatusBlock->Status = status;
+                IoStatusBlock->Information = 0;
+                return status;
+            }
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = 0;
             return STATUS_SUCCESS;
         }
         case XboxFileDispositionInformation: {
@@ -1355,6 +1504,23 @@ typedef struct {
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+
+void xbox_dir_context_drop(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init)
+        return;
+
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        DIR_CONTEXT *ctx = &s_dir_contexts[i];
+        if (ctx->handle != FileHandle)
+            continue;
+        if (ctx->dir)
+            closedir(ctx->dir);
+        memset(ctx, 0, sizeof(*ctx));
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,

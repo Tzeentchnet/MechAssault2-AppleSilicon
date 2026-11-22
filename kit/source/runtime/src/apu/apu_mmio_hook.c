@@ -10,7 +10,12 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
+#if defined(_MSC_VER)
 #include <intrin.h>
+#else
+#define _InterlockedIncrement(p) __atomic_add_fetch((p), 1, __ATOMIC_SEQ_CST)
+#endif
 
 /* A0 counters (apu_core.c): g_apu_ws is set once from RECOMP_AUDIO_WAIT_STATS / RECOMP_PERF. */
 extern int g_apu_ws;
@@ -23,14 +28,25 @@ extern ptrdiff_t g_xbox_mem_offset;
 uint32_t apu_guest_read32(uint32_t address)
 {
     if(g_apu_ws)_InterlockedIncrement(&g_apu_fast_r);
+#if defined(_WIN32)
     if(g_apu_state)return (uint32_t)mcpx_apu_mmio_read(g_apu_state,address-0xFE800000u,4);
+#else
+    MCPXAPUState *state = __atomic_load_n(&g_apu_state, __ATOMIC_ACQUIRE);
+    if(state)return (uint32_t)mcpx_apu_mmio_read(state,address-0xFE800000u,4);
+#endif
     return *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset+address);
 }
 void apu_guest_write32(uint32_t address,uint32_t value)
 {
     if(g_apu_ws)_InterlockedIncrement(&g_apu_fast_w);
+#if defined(_WIN32)
     if(g_apu_state)mcpx_apu_mmio_write(g_apu_state,address-0xFE800000u,value,4);
     else *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset+address)=value;
+#else
+    MCPXAPUState *state = __atomic_load_n(&g_apu_state, __ATOMIC_ACQUIRE);
+    if(state)mcpx_apu_mmio_write(state,address-0xFE800000u,value,4);
+    else *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset+address)=value;
+#endif
 }
 
 /* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
@@ -314,4 +330,169 @@ void apu_veh_report(double secs)
     pr = r; pw = w; pf = f; p0 = a; p1 = b; p2 = c; pfr = fr; pfw = fw;
 }
 
-#endif /* _WIN32 */
+#elif defined(__aarch64__)
+#include "../platform/posix_mmio.h"
+#include "../kernel/xbox_memory_layout.h"
+#include "../usb/ohci.h"
+
+static unsigned long g_apu_posix_reads, g_apu_posix_writes;
+
+#if defined(XBOXRECOMP_TEST_FAILURES)
+__attribute__((weak, noinline))
+void xbox_TestObservePosixDevice(int device) { (void)device; }
+#define OBSERVE_DEVICE(device) xbox_TestObservePosixDevice(device)
+#else
+#define OBSERVE_DEVICE(device) ((void)0)
+#endif
+
+static int apu_is_device(uint32_t off)
+{
+    return off < 0x30000u ||
+        (off >= 0x3F000u && off < 0x40000u) ||
+        (off >= 0x5F000u && off < 0x60000u);
+}
+
+static uint64_t apu_posix_read(void *dev, uint32_t off, int size)
+{
+    uint64_t result = 0;
+    for (int i = 0; i < size;) {
+        uint32_t at = off + (uint32_t)i;
+        int n = size - i, boundary = 4 - (int)(at & 3u);
+        if (n > boundary) n = boundary;
+        uint64_t part = 0;
+        if (apu_is_device(at)) {
+            uint32_t word = (uint32_t)mcpx_apu_mmio_read(dev, at & ~3u, 4);
+            part = (word >> ((at & 3u) * 8u)) &
+                ((UINT64_C(1) << (n * 8)) - 1);
+        } else {
+            volatile uint8_t *p = xbox_McpxMemoryAlias(at, (size_t)n);
+            if (p) for (int j = 0; j < n; ++j) part |= (uint64_t)p[j] << (8 * j);
+        }
+        result |= part << (8 * i);
+        i += n;
+    }
+    __atomic_add_fetch(&g_apu_posix_reads, 1, __ATOMIC_RELAXED);
+    return result;
+}
+
+static void apu_posix_write(void *dev, uint32_t off, uint64_t value, int size)
+{
+    for (int i = 0; i < size;) {
+        uint32_t at = off + (uint32_t)i;
+        int n = size - i, boundary = 4 - (int)(at & 3u);
+        if (n > boundary) n = boundary;
+        uint64_t part = value >> (8 * i);
+        if (apu_is_device(at)) {
+            uint32_t aligned = at & ~3u;
+            uint32_t word = (uint32_t)part;
+            if (n != 4) {
+                unsigned shift = (at & 3u) * 8u;
+                uint32_t mask = (uint32_t)((UINT64_C(1) << (n * 8)) - 1) << shift;
+                uint32_t old = (uint32_t)mcpx_apu_mmio_read(dev, aligned, 4);
+                word = (old & ~mask) | ((word << shift) & mask);
+            }
+            mcpx_apu_mmio_write(dev, aligned, word, 4);
+        } else {
+            volatile uint8_t *p = xbox_McpxMemoryAlias(at, (size_t)n);
+            if (p) for (int j = 0; j < n; ++j) p[j] = (uint8_t)(part >> (8 * j));
+        }
+        i += n;
+    }
+    __atomic_add_fetch(&g_apu_posix_writes, 1, __ATOMIC_RELAXED);
+}
+
+enum PosixMmioOwner { OWNER_ALIAS, OWNER_APU, OWNER_AC97, OWNER_OHCI };
+
+static enum PosixMmioOwner apu_posix_owner(uint32_t va)
+{
+    if (xbox_ApuMmioOwnsAddress(va)) return OWNER_APU;
+    if (xbox_Ac97OwnsAddress(va)) return OWNER_AC97;
+    if (xbox_OhciOwnsAddress(va)) return OWNER_OHCI;
+    return OWNER_ALIAS;
+}
+
+/* Runs exclusively on the broker thread. Validate the whole instruction
+ * before any device or alias operation, so a rejection has no side effects. */
+static int apu_posix_backend(void *dev, XboxPosixMmioRequest *request)
+{
+    uint32_t va = 0xFE800000u + request->fault_offset;
+    enum PosixMmioOwner owner = apu_posix_owner(va);
+    if (owner == OWNER_ALIAS) return 0;
+    for (unsigned i = 0; i < request->count; ++i) {
+        XboxPosixMmioOp *op = &request->op[i];
+        if (!xbox_McpxMemoryAlias(op->offset, op->size)) return 0;
+        for (unsigned j = 0; j < op->size; ++j) {
+            uint32_t at = 0xFE800000u + op->offset + j;
+            enum PosixMmioOwner current = apu_posix_owner(at);
+            if (current != OWNER_ALIAS &&
+                (current != owner ||
+                 (current == OWNER_OHCI && !xbox_OhciPosixSameOwner(va, at))))
+                return 0;
+        }
+    }
+
+    if (owner == OWNER_APU) {
+        if (!dev) return 0;
+        OBSERVE_DEVICE(1);
+        for (unsigned i = 0; i < request->count; ++i) {
+            XboxPosixMmioOp *op = &request->op[i];
+            if (op->write) apu_posix_write(dev, op->offset, op->value, (int)op->size);
+            else op->value = apu_posix_read(dev, op->offset, (int)op->size);
+        }
+        return 1;
+    }
+    if (owner == OWNER_AC97) {
+        OBSERVE_DEVICE(2);
+        for (unsigned i = 0; i < request->count; ++i) {
+            XboxPosixMmioOp *op = &request->op[i];
+            xbox_Ac97PosixAccess(op->offset, &op->value, op->size, op->write);
+        }
+        return 1;
+    }
+    if (owner == OWNER_OHCI) {
+        if (!xbox_OhciIsEnabled()) return 0;
+        OBSERVE_DEVICE(3);
+        return xbox_OhciPosixRequest(va, request);
+    }
+    return 0;
+}
+
+static void apu_posix_publish(void *dev)
+{
+    __atomic_store_n(&g_apu_state, dev, __ATOMIC_RELEASE);
+}
+
+static void apu_posix_unpublish(void *dev)
+{
+    (void)dev;
+    __atomic_store_n(&g_apu_state, NULL, __ATOMIC_RELEASE);
+}
+
+int xbox_PosixMmioStart(void)
+{
+    return xbox_PosixMmioBrokerStart(apu_posix_backend, apu_posix_publish,
+                                     apu_posix_unpublish, UINT64_C(20000000000));
+}
+
+int xbox_PosixMmioAttach(MCPXAPUState *apu)
+{
+    if (!xbox_GetMemoryBase() || !xbox_McpxMemoryAlias(0, 0x800000u))
+        return 0;
+    uintptr_t base = (uintptr_t)xbox_GetMemoryOffset() + UINT32_C(0xFE800000);
+    return xbox_PosixMmioBrokerBind(base, 0x800000u, apu);
+}
+
+void apu_veh_report(double secs)
+{
+    static unsigned long previous_r, previous_w;
+    unsigned long r = __atomic_load_n(&g_apu_posix_reads, __ATOMIC_RELAXED);
+    unsigned long w = __atomic_load_n(&g_apu_posix_writes, __ATOMIC_RELAXED);
+    fprintf(stderr, "[APU-MMIO] %.1f s: trapped reads=%lu writes=%lu\n",
+            secs, r - previous_r, w - previous_w);
+    previous_r = r; previous_w = w;
+}
+#else
+int xbox_PosixMmioStart(void) { return 0; }
+int xbox_PosixMmioAttach(MCPXAPUState *apu) { (void)apu; return 0; }
+void apu_veh_report(double secs) { (void)secs; }
+#endif /* _WIN32 / POSIX AArch64 */

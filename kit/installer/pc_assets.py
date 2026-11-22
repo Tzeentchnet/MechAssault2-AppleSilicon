@@ -117,6 +117,23 @@ def overlay_changes(disc, overlay):
             out[n] = sha(data)
     return out
 
+def verify_overlay(disc, target):
+    expected = json.loads((HERE / 'data' / 'pc-overlay.json').read_text(encoding='utf-8'))
+    overlay = Mgf(target)
+    got = overlay_changes(disc, overlay)
+    if len(overlay.files) != expected['files'] or got != expected['changed']:
+        wrong = sorted(set(got.items()) ^ set(expected['changed'].items()))
+        raise SystemExit('pc_assets/common.mgf does not match the release (%d files differ, e.g. %s)' %
+                         (len(wrong), ', '.join(n for n, _ in wrong[:3])))
+    return got
+
+def verify_existing(install):
+    install = Path(install)
+    target = install / 'pc_assets' / 'common.mgf'
+    verify_overlay(Mgf(install / 'game_files' / 'common.mgf'), target)
+    if (target.parent / 'cache.version').read_bytes() != base.cache_version(target.read_bytes()):
+        raise ValueError('PC asset cache version does not match the overlay')
+
 def build(install, log=print):
     install = Path(install)
     disc_path = install / 'game_files' / 'common.mgf'
@@ -129,15 +146,8 @@ def build(install, log=print):
     add_qte(target, qte_icons.icons(disc))
     hub = next(n for n in Mgf(target).files if n.lower() == scenario_assets.NAME)
     replace(target, scenario_assets.NAME, scenario_assets.transform(Mgf(target).file(hub), base))
-    expected = json.loads((HERE / 'data' / 'pc-overlay.json').read_text(encoding='utf-8'))
-    overlay = Mgf(target)
-    got = overlay_changes(disc, overlay)
-    if len(overlay.files) != expected['files'] or got != expected['changed']:
-        wrong = sorted(set(got.items()) ^ set(expected['changed'].items()))
-        raise SystemExit('pc_assets/common.mgf does not match the release (%d files differ, e.g. %s)' %
-                         (len(wrong), ', '.join(n for n, _ in wrong[:3])))
-    data = target.read_bytes()
-    (target.parent / 'cache.version').write_text('PC2-' + sha(data)[:16] + '\n', encoding='ascii')
+    got = verify_overlay(disc, target)
+    (target.parent / 'cache.version').write_bytes(base.cache_version(target.read_bytes()))
     log('PC menu overlay built: %d files changed or added, all match the release.' % len(got))
 
 def make(disc_common, release_overlay):

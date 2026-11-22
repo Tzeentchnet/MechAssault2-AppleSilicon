@@ -8,7 +8,9 @@
 #include "../kernel/xbox_memory_layout.h"
 #include "../platform/pc_cpu_topo.h"   /* pc_thread_role_enter */
 #include "../platform/pc_switch.h"     /* T2-8: [Audio] Threads */
+#if defined(_WIN32)
 #include <avrt.h>
+#endif
 
 /* A0 counters (apu_core.c): g_apu_ws is on under RECOMP_AUDIO_WAIT_STATS / RECOMP_PERF. */
 extern int g_apu_ws;
@@ -271,6 +273,7 @@ void mcpx_apu_dsp_reset_program(DSPState *dsp)
  * "self" addresses (innermost image frame) and "incl" addresses (any image
  * frame), as image RVAs for lookup in the linker map. Diagnostic only: idle
  * unless stalled; no guest state is touched. */
+#if defined(_WIN32)
 #include <tlhelp32.h>
 #define STALL_THREADS 64
 #define STALL_SLOTS 4096
@@ -395,6 +398,7 @@ static DWORD WINAPI stall_profiler(void *opaque)
     }
     return 0;
 }
+#endif
 
 void mcpx_apu_dsp_native_init(MCPXAPUState *d)
 {
@@ -408,7 +412,16 @@ void mcpx_apu_dsp_native_init(MCPXAPUState *d)
         dsp->dma.mem_opaque=&dsp->core;dsp->dma.mem_read=mem_read;dsp->dma.mem_write=mem_write;
         dsp->dma.rw_opaque=dsp;dsp->dma.scratch_rw=scratch_rw;dsp->dma.fifo_rw=fifo_rw;
         if(d->ram_ptr) {
+#if defined(_WIN32)
             uintptr_t base=(uintptr_t)d->ram_ptr+(p?0xFE850000u:0xFE830000u);
+#else
+            void *alias = xbox_McpxMemoryAlias(p ? 0x50000u : 0x30000u, 0x10000u);
+            if (!alias) {
+                fprintf(stderr, "[APU] %s DSP host memory alias unavailable\n", p ? "EP" : "GP");
+                continue;
+            }
+            uintptr_t base = (uintptr_t)alias;
+#endif
             dsp->core.mapped_xram=(uint32_t *)base;
             dsp->core.mapped_yram=(uint32_t *)(base+0x6000);
             dsp->core.mapped_pram=(uint32_t *)(base+0xA000);
@@ -687,14 +700,20 @@ static int dsp_plan_choose(void)
     int v=pc_switch_choice("RECOMP_APU_THREADS","Audio","Threads",names,4,3);
     unsigned cpus=pc_cpu_logical();
     if(v==3)v=cpus<=4?DSP_PLAN_LOW:DSP_PLAN_HIGH;
+#if defined(_WIN32)
     fprintf(stderr,"[APU] threads: cpus=%u plan=%s (APU thread MMCSS HIGH%s)\n",cpus,
             v==DSP_PLAN_LOW?"low":v==DSP_PLAN_INLINE?"inline":"high",
             v==DSP_PLAN_LOW?"; DSP thread NORMAL, no boost, lag guard":v==DSP_PLAN_INLINE?"; GP/EP inline":"; DSP thread MMCSS HIGH");
+#else
+    fprintf(stderr,"[APU] threads: cpus=%u plan=%s (host scheduling; MMCSS unavailable)\n",cpus,
+            v==DSP_PLAN_LOW?"low":v==DSP_PLAN_INLINE?"inline":"high");
+#endif
     if(v==DSP_PLAN_LOW)g_dsp_prio_high=0;
     return v;
 }
 static void dsp_thread_set_prio(HANDLE *mmcss,int high)
 {
+#if defined(_WIN32)
     HANDLE self=GetCurrentThread();
     if(high) {
         if(!*mmcss) {
@@ -708,6 +727,10 @@ static void dsp_thread_set_prio(HANDLE *mmcss,int high)
         SetThreadPriority(self,THREAD_PRIORITY_NORMAL);
         SetThreadPriorityBoost(self,TRUE);   /* TRUE = boosts off: stays at 8 when the go event wakes it */
     }
+#else
+    (void)mmcss;
+    (void)high;
+#endif
 }
 /* APU thread, every 8th frame, low plan only: promote/demote the DSP thread from the real-time lag. */
 static void dsp_guard_tick(MCPXAPUState *d)
@@ -804,6 +827,7 @@ void apu_dsp_pram_report(double secs)
 
 bool mcpx_apu_dsp_native_frame(MCPXAPUState *d,float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+#if defined(_WIN32)
     {
         static int started; /* first frame: guest RAM is mapped */
         static int v_init; static const char *v; /* getenv once: runs every DSP frame */
@@ -815,6 +839,16 @@ bool mcpx_apu_dsp_native_frame(MCPXAPUState *d,float mixbins[NUM_MIXBINS][NUM_SA
             if(t)CloseHandle(t);
         }
     }
+#else
+    {
+        static int reported;
+        const char *profile = getenv("RECOMP_STALL_PROFILE");
+        if (!reported && profile && atoi(profile) >= 1) {
+            fprintf(stderr, "[STALL] Windows thread sampling is unavailable on this host\n");
+            reported = 1;
+        }
+    }
+#endif
     /* The previous frame's GP/EP first: everything after this sees the DSPs at rest. */
     dsp_thread_join();
     if(g_apu_ws)pram_sample(d);

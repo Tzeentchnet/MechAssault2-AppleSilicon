@@ -17,6 +17,9 @@ PARENT_STATE=0x007D2089
 HORIZONTAL_JUSTIFICATION=0xE7F7101D
 VERTICAL_JUSTIFICATION=0xF8F5965B
 
+def cache_version(data):
+    return ('PC2-'+hashlib.sha256(data).hexdigest()[:16]+'\r\n').encode('ascii')
+
 def parse(data):
     magic,count,_,_=struct.unpack_from('<4I',data)
     assert magic==0xF8002E00
@@ -161,7 +164,7 @@ def build():
         assert verify.records[verify.files[name]][1]==zlib.crc32(payload)^0xffffffff
     # The retail loader caches whole archives. A content-specific namespace
     # prevents old menus from surviving an application/asset update.
-    (out.parent/'cache.version').write_text('PC2-'+hashlib.sha256(data).hexdigest()[:16]+'\n',encoding='ascii')
+    (out.parent/'cache.version').write_bytes(cache_version(data))
     print(f'Built {len(changes)} native forms in {out} ({len(data):,} bytes)')
 
 if __name__=='__main__':

@@ -479,7 +479,8 @@ void xbox_ClockStart(volatile ULONG *mapped_ticks)
     s_clock_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (s_clock_stop) s_clock_thread = CreateThread(NULL, 0, clock_worker, NULL, 0, NULL);
     if (!s_clock_thread) {
-        fprintf(stderr, "[CLOCK] Cannot start independent guest clock (%lu)\n", GetLastError());
+        fprintf(stderr, "[CLOCK] Cannot start independent guest clock (%lu)\n",
+                (unsigned long)GetLastError());
         xbox_ClockStop();
     }
 }

@@ -1,0 +1,7 @@
+if(NOT DEFINED PROBE)
+    message(FATAL_ERROR "Missing legacy PGRAPH probe")
+endif()
+execute_process(COMMAND "${PROBE}" RESULT_VARIABLE result ERROR_VARIABLE error)
+if(result STREQUAL "0" OR NOT error MATCHES "legacy D3D8/D3D11 PGRAPH translator is unavailable")
+    message(FATAL_ERROR "The omitted legacy translator did not fail clearly")
+endif()

@@ -1,7 +1,7 @@
 #include "audio_lifetime.h"
 #include <windows.h>
 #include <stddef.h>
-#include <limits.h>
+#include <stdint.h>
 
 extern ptrdiff_t g_xbox_mem_offset;
 static volatile LONG *references(uint32_t object)
@@ -16,7 +16,7 @@ int ma2_audio_deferred_retain(uint32_t object)
 {
     volatile LONG *count=references(object);
     LONG current=InterlockedCompareExchange(count,0,0);
-    while(current>0 && current<LONG_MAX) {
+    while(current>0 && current<INT32_MAX) {
         LONG seen=InterlockedCompareExchange(count,current+1,current);
         if(seen==current)return 1;
         current=seen;
