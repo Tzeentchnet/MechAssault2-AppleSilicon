@@ -5,14 +5,16 @@ kernel, storage, audio, USB, and renderer initialization, and reaches the
 first campaign mission through the CPU NV2A reference executor and SDL
 presenter. The private guest also registers the first synchronous downstream
 Metal slice, with explicit CPU fallback for unsupported state. Scripted input
-has established active mission execution. The primary fragmented-geometry bug
-is fixed, and a matching retail A/B confirms the major purple-floor bands and
-widespread horizontal flecks are gone after the dependent texture-stage work.
-Thin coloured lines still need classification, lifted Bink output remains
-corrupt, CPU rendering remains roughly 1-2.5 FPS depending on scene and worker
-count, and physical controls/audio plus cooperative shutdown are unverified.
-This is not yet an accepted playable port or a complete Metal renderer. The work
-reconciles the MA2 runtime at
+has established active mission execution and verified keyboard-driven movement,
+camera, and fire responses after the player-control component replaces the menu
+component. The primary fragmented-geometry bug is fixed, and a matching retail
+A/B confirms the major purple-floor bands and widespread horizontal flecks are
+gone after the dependent texture-stage work. Thin coloured lines still need
+classification, lifted Bink output remains corrupt, CPU rendering remains
+roughly 1-2.5 FPS depending on scene and worker count, and physical
+controls/audio plus cooperative shutdown are unverified. This is not yet an
+accepted playable port or a complete Metal renderer. The work reconciles the
+MA2 runtime at
 [`5ecc611d18e20de1ab04313b0c50e453d8d63b29`](https://github.com/Mazillion/MechAssault2-PC-Recomp/commit/5ecc611d18e20de1ab04313b0c50e453d8d63b29)
 against the clean xboxrecomp v0.18.0 release at
 [`37b61d589168adee3680fabd51805ee81427bf07`](https://github.com/sp00nznet/xboxrecomp/commit/37b61d589168adee3680fabd51805ee81427bf07).
@@ -76,13 +78,29 @@ changing 640x480 frames. Internal framebuffer readback has confirmed:
 - authoritative QueueFlip scanout alternating between the two expected
   surfaces.
 
-A 330-second control probe appended B, held-forward, camera-left, and fire
-commands after mission entry. Its 243 interval-two captures contained 197
-unique images, but the commands all landed during the letterboxed in-engine
-cinematic: no HUD or unambiguous player-controlled response appeared. The
-process exited with the configured watchdog status 3 because the harness
-scheduled `close` after the 330-second watchdog, not because of a renderer or
-memory fault. Player control therefore remains unproven.
+Early image-only control gates were rejected. Full-height frames occurred
+inside the opening cinematic, and a later dark/cyan/green signature was an
+authored control-room transition rather than the HUD. The accepted gate uses
+`RECOMP_BOT_DIAG=1`: the frontend's original look component is recorded, and
+commands are withheld until the primary context calls the look path with a
+different, unlocked component. The matching capture has the complete pilot
+HUD and an active third-person player view.
+
+The bounded control route used the CPU oracle with eight opt-in raster workers.
+To finish the long opening under the diagnostic deadline, it disabled register
+combiners only while an owner-controlled flag existed. At the player-component
+transition the harness removed the flag, the executor reported that register
+combiners were restored at the next frame boundary, and the route waited before
+capturing input responses. The resulting full-shading sequence shows the pilot
+entering a forward stride, the camera rotating to a different side of the
+scene, and a bright green weapon discharge after fire. Consecutive checkpoints
+changed 20.6%, 94.6%, and 100.0% of pixels respectively; the firing checkpoint
+contained 1,114 bright-green pixels versus 311-353 in the preceding
+checkpoints. `close` was issued immediately after the sequence. The process
+returned the known cooperative-shutdown status 1 (`worker_stop_requested`
+followed by `worker_failed`), with no watchdog status 3. This establishes
+scripted player control, not physical-controller, audio, save/restart, or
+performance acceptance.
 
 The dotted diagonal geometry was caused by clipping only against positive W.
 The vertex-program epilogue already emits screen-space coordinates, so the
@@ -316,6 +334,14 @@ buffer directly when the hardware debug-pixel hook is unavailable. This makes
 `RECOMP_FRAME_TRACE_PIXEL` and `RECOMP_FRAME_TRACE_DEPTH` useful on macOS
 instead of reporting only triangle coverage.
 
+`RECOMP_NO_COMBINERS` retains its fixed diagnostic behavior.
+`RECOMP_NO_COMBINERS_WHILE_FILE=<flag>` adds a reversible diagnostic gate:
+the executor samples the flag once at each completed QueueFlip (and on the
+first transformed draw), disables register combiners while it exists, and
+restores them after removal. It never changes the default path. A focused
+executor regression checks both transitions and requires the exact dependent
+texture-stage result after restoration.
+
 The CPU oracle also has an opt-in POSIX row-split raster pool for large
 triangles. It uses persistent pthread workers, per-worker counters and DXT
 decode caches, joins the workers before guest-memory teardown, and keeps
@@ -528,7 +554,11 @@ Focused follow-up validation additionally passes the protected contiguous
 free/reuse regression in both memory-dispatch configurations and the executor's
 linear backend test plus its swizzled partial-clear/draw, registered-fallback
 strip-culling, mirror/border texture-addressing, dependent texture-stage, and
-POSIX parallel-raster tests. The swizzled test
+POSIX parallel-raster tests. A frame-boundary combiner-gate regression disables
+the final combiner while a marker exists, removes the marker, and requires the
+exact dependent-stage output after the next flip; it then verifies the reverse
+transition as well. The current injected Release suite passes **30/30**. The
+swizzled test
 would fail if either clear or raster output were written row-major; the strip
 test would fail if odd triangles retained the old winding; the dependent-stage
 test would fail if the traced `DOTPRODUCT`/`DOT_ST`, dependent AR, bump, or

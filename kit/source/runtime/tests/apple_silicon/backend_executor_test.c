@@ -352,6 +352,28 @@ static int test_texture_dependencies(void)
     return 0;
 }
 
+static int test_combiner_gate(void)
+{
+    const char *marker = "ma2-no-combiners-while-file";
+    FILE *enable;
+    CHECK(access(marker, F_OK) != 0);
+    CHECK(setenv("RECOMP_NO_COMBINERS_WHILE_FILE", marker, 1) == 0);
+    enable = fopen(marker, "wx");
+    CHECK(enable && fclose(enable) == 0);
+    CHECK(draw_dependent_texel(0x02621u, 2, 0xffff0000u) == 0xffff0000u);
+
+    CHECK(remove(marker) == 0);
+    nv2a_pb_exec_method(0, 0x0130, 0);
+    CHECK(draw_dependent_texel(0x02621u, 2, 0xffff0000u) == 0xff55aa22u);
+
+    enable = fopen(marker, "wx");
+    CHECK(enable && fclose(enable) == 0);
+    nv2a_pb_exec_method(0, 0x0130, 0);
+    CHECK(draw_dependent_texel(0x02621u, 2, 0xffff0000u) == 0xffff0000u);
+    CHECK(remove(marker) == 0);
+    return 0;
+}
+
 static int test_parallel_raster(void)
 {
     enum { W = 192, H = 192, POS = RENDER + W * H * 4, DIFF = POS + 0x100 };
@@ -427,6 +449,13 @@ int main(int argc, char **argv)
         xbox_FramebufferHostClose();
         xbox_MemoryLayoutShutdown();
         puts("NV2A executor: dependent texture stage programs passed");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "combiner-gate") == 0) {
+        CHECK(test_combiner_gate() == 0);
+        xbox_FramebufferHostClose();
+        xbox_MemoryLayoutShutdown();
+        puts("NV2A executor: frame-boundary diagnostic combiner gate passed");
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "parallel-raster") == 0) {

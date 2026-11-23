@@ -33,6 +33,7 @@
 #include <time.h>
 #if !defined(_WIN32)
 #include <pthread.h>
+#include <unistd.h>
 #endif
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
@@ -3107,6 +3108,47 @@ static void raster_pool_shutdown(void)
 }
 #endif
 
+/* The fixed switch preserves its existing process-lifetime behavior. The flag
+ * form is sampled at completed flips so diagnostics can restore full shading
+ * without a filesystem query in every triangle or pixel. */
+static struct {
+    int initialized;
+    int fixed;
+    int enabled;
+    const char *while_file;
+} s_no_combiners;
+
+static void no_combiners_refresh(void)
+{
+    int enabled;
+    if (!s_no_combiners.initialized) {
+        s_no_combiners.fixed = getenv("RECOMP_NO_COMBINERS") != NULL;
+        s_no_combiners.while_file = getenv("RECOMP_NO_COMBINERS_WHILE_FILE");
+        s_no_combiners.enabled = -1;
+        s_no_combiners.initialized = 1;
+    }
+    enabled = s_no_combiners.fixed;
+    if (!enabled && s_no_combiners.while_file && *s_no_combiners.while_file)
+#if defined(_WIN32)
+        enabled = GetFileAttributesA(s_no_combiners.while_file) != INVALID_FILE_ATTRIBUTES;
+#else
+        enabled = access(s_no_combiners.while_file, F_OK) == 0;
+#endif
+    if (enabled != s_no_combiners.enabled) {
+        s_no_combiners.enabled = enabled;
+        if (s_no_combiners.while_file && *s_no_combiners.while_file)
+            fprintf(stderr, "[NV2A] diagnostic register combiners %s at frame boundary\n",
+                    enabled ? "disabled" : "restored");
+    }
+}
+
+static int no_combiners_enabled(void)
+{
+    if (!s_no_combiners.initialized)
+        no_combiners_refresh();
+    return s_no_combiners.enabled;
+}
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
@@ -3116,15 +3158,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     const float *a, *b, *c;
     float area, su = 1.0f, sv = 1.0f;
     int k;
-    static int no_rc = -1;
-
-    if (no_rc < 0)
-        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
     memset(&T, 0, sizeof T);
     T.mem = (uint8_t *)xbox_GetMemoryOffset();
     T.bpp = surface_bpp();
     T.textured = s_gpu.texs[0].valid;
-    T.use_rc = s_gpu.rc_seen && !no_rc;
+    T.use_rc = s_gpu.rc_seen && !no_combiners_enabled();
 #if defined(__APPLE__)
     uint32_t zformat = (s_gpu.format >> 4) & 15u;
     T.quantize_depth = nv2a_dispatch_registered() && s_gpu.depth_test && s_gpu.zeta_offset &&
@@ -4996,6 +5034,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_FLIP_STALL:
+        no_combiners_refresh();
         /* QueueFlip is authoritative. Clip area cannot identify scanout:
          * MA2's letterboxed 640x240 view is smaller than its 512x512 bloom
          * pass, and the old heuristic showed that pass as a missing shot. */

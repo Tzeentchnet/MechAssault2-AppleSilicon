@@ -64,12 +64,13 @@ add_test(NAME backend_executor_swizzled_surface COMMAND backend_executor_test sw
 add_test(NAME backend_executor_strip_culling COMMAND backend_executor_test strip-culling)
 add_test(NAME backend_executor_texture_addressing COMMAND backend_executor_test texture-addressing)
 add_test(NAME backend_executor_texture_dependencies COMMAND backend_executor_test texture-dependencies)
+add_test(NAME backend_executor_combiner_gate COMMAND backend_executor_test combiner-gate)
 add_test(NAME backend_executor_parallel_raster COMMAND backend_executor_test parallel-raster)
 set_tests_properties(backend_executor PROPERTIES
     ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
 set_tests_properties(backend_executor_swizzled_surface backend_executor_strip_culling
     backend_executor_texture_addressing backend_executor_texture_dependencies
-    backend_executor_parallel_raster PROPERTIES
+backend_executor_combiner_gate backend_executor_parallel_raster PROPERTIES
     ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
 
 if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$" AND
