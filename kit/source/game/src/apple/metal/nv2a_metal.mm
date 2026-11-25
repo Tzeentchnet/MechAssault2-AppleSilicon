@@ -108,9 +108,13 @@ struct Guest {
     Float4 factor0[8], factor1[8], tex_info[4];
     Uint4 texture_control;
     Float4 bump_matrix[4], bump_luminance[4], eye_vector, texture_bias, misc;
+    // Border colours Metal samplers cannot express: per stage, bit 0/1 for
+    // U/V in border mode and bit 2 for bilinear filtering.
+    Float4 border_color[4];
+    Uint4 border_mode;
 };
 
-static_assert(sizeof(Guest) == 45 * 16, "Metal Guest layout");
+static_assert(sizeof(Guest) == 50 * 16, "Metal Guest layout");
 static_assert(sizeof(Vertex) == 8 * 16, "Metal Vertex layout");
 
 struct TextureLevel {
@@ -165,6 +169,8 @@ struct Resident {
     bool depth = false;
     bool stale = false;   // guest RAM is newer than the texture
     Rect dirty;           // texture is newer than guest RAM here
+    uint64_t serial = 0;  // unique per resident surface
+    uint64_t version = 0; // bumped whenever the texture's contents change
     __strong id<MTLTexture> texture = nil;
 };
 
@@ -176,6 +182,15 @@ struct Upload {
 struct CachedTexture {
     __strong id<MTLTexture> texture = nil;
     uint64_t bytes = 0, used = 0;
+};
+
+/* A sampled copy of a resident colour surface, made on the GPU. */
+struct SurfaceCopy {
+    __strong id<MTLTexture> texture = nil;
+    uint64_t source = 0, version = 0;
+    uint32_t offset = 0, width = 0, height = 0, pitch = 0, color = 0;
+    // Z24S8 sources: depth and stencil planes and the packed dwords.
+    __strong id<MTLBuffer> depth = nil, stencil = nil, packed = nil;
 };
 
 struct ContentMemo {
@@ -233,6 +248,7 @@ struct Ma2MetalRenderer {
     __strong id<MTLFunction> clear_color = nil;
     __strong id<MTLFunction> clear_depth = nil;
     __strong id<MTLComputePipelineState> clear = nil;
+    __strong id<MTLComputePipelineState> pack_depth = nil;
     __strong NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *pipelines = nil;
     __strong NSMutableDictionary<NSNumber *, id<MTLSamplerState>> *samplers = nil;
     __strong NSMutableDictionary<NSNumber *, id<MTLDepthStencilState>> *depth_states = nil;
@@ -259,6 +275,8 @@ struct Ma2MetalRenderer {
     uint64_t visibility_resolved = 0;
 
     std::unordered_map<uint64_t, CachedTexture> textures;
+    std::unordered_map<uint64_t, SurfaceCopy> surface_copies;
+    uint64_t resident_ids = 0, surface_copy_blits = 0, surface_copy_hits = 0;
     std::unordered_map<uint64_t, ContentMemo> memo;
     uint64_t texture_bytes = 0, epoch = 1, texture_clock = 0;
 
@@ -686,6 +704,7 @@ static bool load(Ma2MetalRenderer *m, Resident &r)
     }
     if (!r.depth) {
         ++m->color_loads;
+        ++r.version;
         MTLRegion region = MTLRegionMake2D(0, 0, r.width, r.height);
         if (r.bpp == 4) {
             [r.texture replaceRegion:region mipmapLevel:0 withBytes:base bytesPerRow:r.pitch];
@@ -739,6 +758,7 @@ static bool load(Ma2MetalRenderer *m, Resident &r)
                        options:MTLBlitOptionStencilFromDepthStencil];
     [blit endEncoding];
     r.stale = false;
+    ++r.version;
     return true;
 }
 
@@ -862,6 +882,7 @@ static Resident *resident(Ma2MetalRenderer *m, bool depth, uint32_t va, uint32_t
     r->width = width; r->height = height;
     r->domain = domain; r->offset = offset; r->bytes = mapped.bytes;
     r->depth = depth;
+    r->serial = ++m->resident_ids;
     r->texture = surface_texture(m, depth, format, texture_extent(width), texture_extent(height));
     if (!r->texture || !load(m, *r)) return nullptr;
     m->surfaces.push_back(std::move(r));
@@ -1181,7 +1202,7 @@ static void report_operation(Ma2MetalRenderer *m, bool draw, int accepted)
             "[NV2A-METAL] operations=%llu submissions=%llu waits=%llu "
             "clear=%llu accepted/%llu declined draw=%llu accepted/%llu declined "
             "loads=%llu/%llu writebacks=%llu/%llu textures=%llu hit/%llu miss %.1fMB "
-            "surfaces=%zu declines:%s\n",
+            "rtt=%llu blit/%llu reuse surfaces=%zu declines:%s\n",
             (unsigned long long)total, (unsigned long long)m->submissions,
             (unsigned long long)m->waits,
             (unsigned long long)m->clear_accepted, (unsigned long long)m->clear_declined,
@@ -1189,7 +1210,9 @@ static void report_operation(Ma2MetalRenderer *m, bool draw, int accepted)
             (unsigned long long)m->color_loads, (unsigned long long)m->depth_loads,
             (unsigned long long)m->color_writebacks, (unsigned long long)m->depth_writebacks,
             (unsigned long long)m->texture_hits, (unsigned long long)m->texture_misses,
-            m->texture_bytes / 1048576.0, m->surfaces.size(), used ? declines : " none");
+            m->texture_bytes / 1048576.0,
+            (unsigned long long)m->surface_copy_blits, (unsigned long long)m->surface_copy_hits,
+            m->surfaces.size(), used ? declines : " none");
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,8 +1349,14 @@ static int clear_impl(Ma2MetalRenderer *m, const Nv2aGpuState *s, uint32_t mask,
     [m->encoder setDepthClipMode:MTLDepthClipModeClamp];
     [m->encoder setFragmentBytes:&value length:sizeof(value) atIndex:0];
     [m->encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    if (target) target->dirty.add(g.x, g.y, g.w, g.h);
-    if (depth) depth->dirty.add(g.x, g.y, g.w, g.h);
+    if (target) {
+        target->dirty.add(g.x, g.y, g.w, g.h);
+        ++target->version;
+    }
+    if (depth) {
+        depth->dirty.add(g.x, g.y, g.w, g.h);
+        ++depth->version;
+    }
     after_draw(m);
     return 1;
 }
@@ -1422,10 +1451,12 @@ static bool prepare_textures(const Nv2aGpuState *s, Nv2aGpuTexel texel,
             t.width > kMaxExtent || t.height > kMaxExtent ||
             t.dimensionality > 2)
             return false;
-        if ((t.addr_u == 4 || t.addr_v == 4) &&
-            t.border_color != 0 && t.border_color != 0xff000000u &&
-            t.border_color != 0xffffffffu)
-            return false;
+        bool border = t.addr_u == 4 || t.addr_v == 4;
+        // Other border colours are blended in the shader by coverage, which
+        // is exact only for one level and one filter, as the CPU samples.
+        bool custom_border = border && t.border_color != 0 &&
+            t.border_color != 0xff000000u && t.border_color != 0xffffffffu;
+        if (custom_border && t.cube) return false;
 
         uint32_t block = d3d8_format_dxt_block_bytes(t.color);
         bool packed = block || d3d8_format_is_swizzled(t.color);
@@ -1443,6 +1474,12 @@ static bool prepare_textures(const Nv2aGpuState *s, Nv2aGpuTexel texel,
         upload.min_linear = min_filter == 2 || min_filter == 4 || min_filter == 6 || min_filter == 7;
         upload.mag_linear = mag_filter == 2 || mag_filter == 4;
         if (((t.control0 >> 4) & 3) && upload.min_linear && upload.mag_linear) return false;
+        if (custom_border) {
+            if (upload.mipmapped || upload.min_linear != upload.mag_linear) return false;
+            unpack_color(t.border_color, g.border_color[stage]);
+            g.border_mode.value[stage] = (t.addr_u == 4 ? 1u : 0u) | (t.addr_v == 4 ? 2u : 0u) |
+                                         (upload.mag_linear ? 4u : 0u);
+        }
         uint32_t levels = upload.mipmapped && t.levels ? std::min(t.levels, 13u) : 1;
         uint32_t max_levels = 1;
         for (uint32_t extent = std::max(t.width, t.height); extent > 1; extent >>= 1)
@@ -1512,6 +1549,7 @@ static id<MTLSamplerState> sampler(Ma2MetalRenderer *m, const Nv2aGpuTexture &t,
 {
     uint32_t min_filter = (t.filter >> 16) & 255;
     uint32_t mip = !upload.mipmapped ? 0 : min_filter >= 5 ? 2 : 1;
+    // Any other colour samples transparent black; the shader adds the rest.
     uint32_t border = t.border_color == 0xff000000u ? 1 : t.border_color == 0xffffffffu ? 2 : 0;
     uint64_t key = (uint64_t)(t.addr_u & 7) | (uint64_t)(t.addr_v & 7) << 3 |
                    (uint64_t)upload.min_linear << 6 | (uint64_t)upload.mag_linear << 7 |
@@ -1572,10 +1610,171 @@ static void evict_textures(Ma2MetalRenderer *m)
 }
 
 /* Returns 1 with the texture, 0 to decline (nothing issued), -1 on failure. */
+/* Z24S8 to the guest's dwords, on the GPU and in command order: blit depth
+ * and stencil to buffers, pack them, blit the dwords into copy.texture. The
+ * dword's little-endian bytes are BGRA8's B,G,R,A, as LIN_A8R8G8B8 decodes. */
+static bool encode_depth_pack(Ma2MetalRenderer *m, Resident &source, SurfaceCopy &copy)
+{
+    uint32_t w = copy.width, h = copy.height;
+    size_t pixels = (size_t)w * h;
+    if (!copy.depth) {
+        copy.depth = [m->device newBufferWithLength:pixels * 4 options:MTLResourceStorageModePrivate];
+        copy.stencil = [m->device newBufferWithLength:pixels options:MTLResourceStorageModePrivate];
+        copy.packed = [m->device newBufferWithLength:pixels * 4 options:MTLResourceStorageModePrivate];
+        if (!copy.depth || !copy.stencil || !copy.packed) {
+            fail(m, Failure::Resource, "depth texture buffers");
+            return false;
+        }
+    }
+    MTLOrigin origin = {0, 0, 0};
+    MTLSize size = {w, h, 1};
+    id<MTLBlitCommandEncoder> blit = blit_encoder(m);
+    if (!blit) return false;
+    [blit copyFromTexture:source.texture sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:size
+                 toBuffer:copy.depth destinationOffset:0 destinationBytesPerRow:(NSUInteger)w * 4
+  destinationBytesPerImage:pixels * 4 options:MTLBlitOptionDepthFromDepthStencil];
+    [blit copyFromTexture:source.texture sourceSlice:0 sourceLevel:0 sourceOrigin:origin sourceSize:size
+                 toBuffer:copy.stencil destinationOffset:0 destinationBytesPerRow:w
+  destinationBytesPerImage:pixels options:MTLBlitOptionStencilFromDepthStencil];
+    [blit endEncoding];
+    id<MTLComputeCommandEncoder> encoder = [m->command computeCommandEncoder];
+    if (!encoder) {
+        fail(m, Failure::Resource, "depth pack encoder");
+        return false;
+    }
+    uint32_t extent[2] = {w, h};
+    [encoder setComputePipelineState:m->pack_depth];
+    [encoder setBuffer:copy.depth offset:0 atIndex:0];
+    [encoder setBuffer:copy.stencil offset:0 atIndex:1];
+    [encoder setBuffer:copy.packed offset:0 atIndex:2];
+    [encoder setBytes:extent length:sizeof(extent) atIndex:3];
+    [encoder dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [encoder endEncoding];
+    blit = [m->command blitCommandEncoder];
+    if (!blit) {
+        fail(m, Failure::Resource, "blit encoder");
+        return false;
+    }
+    [blit copyFromBuffer:copy.packed sourceOffset:0 sourceBytesPerRow:(NSUInteger)w * 4
+       sourceBytesPerImage:pixels * 4 sourceSize:size toTexture:copy.texture destinationSlice:0
+          destinationLevel:0 destinationOrigin:origin];
+    [blit endEncoding];
+    return true;
+}
+
+/* Render to texture: a linear texture that is exactly a resident colour
+ * surface is copied on the GPU, in command order, instead of written back,
+ * waited for and decoded texel by texel. Channels match the CPU decoder:
+ * LIN_A8R8G8B8 and LIN_G8B8 (0xFF000000 | G:B) are the resident texels as
+ * stored; LIN_X8R8G8B8 reads alpha as one. A Z24S8 depth surface read as
+ * LIN_A8R8G8B8/X8R8G8B8 is packed to its guest dwords by a compute pass.
+ * Returns 0 when not applicable. */
+static int resolve_resident(Ma2MetalRenderer *m, const TextureUpload &upload,
+                            __strong id<MTLTexture> &out)
+{
+    const Nv2aGpuTexture &t = upload.levels[0].descriptor;
+    if (upload.cube || upload.levels.size() != 1) return 0;
+    uint32_t surface_format;
+    switch (t.color) {
+    case 0x12: case 0x1E: surface_format = kColorA8R8G8B8; break;
+    case 0x17: surface_format = kColorG8B8; break;
+    default: return 0;
+    }
+    Resident *source = nullptr;
+    for (auto &surface : m->surfaces) {
+        Resident &r = *surface;
+        bool format_ok = r.depth ? r.format == 2 && surface_format == kColorA8R8G8B8
+                                 : r.format == surface_format;
+        if (format_ok && r.va == t.offset && r.pitch == t.pitch &&
+            t.width <= r.width && t.height <= r.height) {
+            source = &r;
+            break;
+        }
+    }
+    if (!source) return 0;
+    if (source->stale && !load(m, *source)) return -1;
+
+    uint32_t fields[] = {t.offset, t.width, t.height, t.pitch, t.color};
+    SurfaceCopy &copy = m->surface_copies[hash_bytes(fields, sizeof(fields), 0x7274742d636f7079ull)];
+    // A hash collision must not hand back another surface's copy.
+    if (copy.offset != t.offset || copy.width != t.width || copy.height != t.height ||
+        copy.pitch != t.pitch || copy.color != t.color) {
+        copy = SurfaceCopy();
+        copy.offset = t.offset; copy.width = t.width; copy.height = t.height;
+        copy.pitch = t.pitch; copy.color = t.color;
+    }
+    if (copy.texture && copy.source == source->serial && copy.version == source->version) {
+        ++m->surface_copy_hits;
+        out = copy.texture;
+        return 1;
+    }
+    if (!copy.texture) {
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                        width:t.width height:t.height mipmapped:NO];
+        desc.usage = MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModePrivate;
+        if (t.color == 0x1E)
+            desc.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+                                                         MTLTextureSwizzleBlue, MTLTextureSwizzleOne);
+        copy.texture = [m->device newTextureWithDescriptor:desc];
+        if (!copy.texture) {
+            fail(m, Failure::Resource, "render-to-texture copy");
+            return -1;
+        }
+    }
+    if (source->depth) {
+        if (!encode_depth_pack(m, *source, copy)) return -1;
+    } else {
+        id<MTLBlitCommandEncoder> blit = blit_encoder(m);
+        if (!blit) return -1;
+        [blit copyFromTexture:source->texture sourceSlice:0 sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(t.width, t.height, 1)
+                    toTexture:copy.texture destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+    }
+    ++m->surface_copy_blits;
+    copy.source = source->serial;
+    copy.version = source->version;
+    out = copy.texture;
+    if (m->surface_copies.size() > 256) {
+        // Bounded: drop the others; the one just made stays.
+        SurfaceCopy keep = copy;
+        m->surface_copies.clear();
+        m->surface_copies[hash_bytes(fields, sizeof(fields), 0x7274742d636f7079ull)] = keep;
+    }
+    return 1;
+}
+
+/* RECOMP_PERF: the first few textures that force a resident surface to be
+ * written back (and waited for) because they overlap it without matching. */
+static void sample_texture_writeback(Ma2MetalRenderer *m, const Nv2aGpuTexture &t, uint64_t span)
+{
+    static unsigned printed;
+    unsigned domain;
+    uint64_t offset;
+    if (printed >= 12 || !span || span > SIZE_MAX ||
+        !ma2_metal_backing(t.offset, (size_t)span, &domain, &offset))
+        return;
+    for (auto &surface : m->surfaces) {
+        const Resident &r = *surface;
+        if (r.dirty.empty() || !aliases(r, domain, offset, (size_t)span)) continue;
+        ++printed;
+        fprintf(stderr, "[NV2A-METAL] texture writeback tex=%08x fmt%02x %ux%u pitch%u lv%u "
+                "surface=%08x fmt%x %ux%u pitch%u %s\n", t.offset, t.color, t.width, t.height,
+                t.pitch, t.levels, r.va, r.format, r.width, r.height, r.pitch,
+                r.depth ? "depth" : "color");
+        return;
+    }
+}
+
 static int resolve_texture(Ma2MetalRenderer *m, const TextureUpload &upload,
                            Nv2aGpuTexel texel, __strong id<MTLTexture> &out)
 {
     const Nv2aGpuTexture &t = upload.levels[0].descriptor;
+    if (int resident_status = resolve_resident(m, upload, out)) return resident_status;
+    if (m->perf) sample_texture_writeback(m, t, upload.span);
     bool paletted = t.color == 0x0B && t.palette;
     if (!flush_writes(m, t.offset, upload.span) ||
         (paletted && !flush_writes(m, t.palette, 1024)))
@@ -1991,10 +2190,14 @@ static int draw_impl(Ma2MetalRenderer *m, const Nv2aGpuState *s, const Nv2aVshOu
                             alpha:(c >> 24) / 255.0f];
     }
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertices.size()];
-    if (s->color_mask & (cformat == kColorG8B8 ? 0x00000101u : 0x01010101u))
+    if (s->color_mask & (cformat == kColorG8B8 ? 0x00000101u : 0x01010101u)) {
         target->dirty.add(g.x, g.y, g.w, g.h);
-    if (depth && ((s->depth_test && s->depth_mask) || writes_stencil(test)))
+        ++target->version;
+    }
+    if (depth && ((s->depth_test && s->depth_mask) || writes_stencil(test))) {
         depth->dirty.add(g.x, g.y, g.w, g.h);
+        ++depth->version;
+    }
     after_draw(m);
     return 1;
 }
@@ -2204,6 +2407,9 @@ extern "C" Ma2MetalRenderer *ma2_metal_create(int console_fd, int log_fd)
             m->clear_depth = [m->library newFunctionWithName:@"ma2_clear_depth"];
             id<MTLFunction> clear = [m->library newFunctionWithName:@"ma2_clear"];
             if (clear) m->clear = [m->device newComputePipelineStateWithFunction:clear error:&error];
+            id<MTLFunction> pack_depth = [m->library newFunctionWithName:@"ma2_pack_depth"];
+            if (pack_depth)
+                m->pack_depth = [m->device newComputePipelineStateWithFunction:pack_depth error:&error];
             m->pipelines = [[NSMutableDictionary alloc] init];
             m->samplers = [[NSMutableDictionary alloc] init];
             m->depth_states = [[NSMutableDictionary alloc] init];
@@ -2223,7 +2429,7 @@ extern "C" Ma2MetalRenderer *ma2_metal_create(int console_fd, int log_fd)
             m->white_sampler = [m->device newSamplerStateWithDescriptor:[[MTLSamplerDescriptor alloc] init]];
             if (!m->vertex || !m->color || !m->color_depth || !m->shaded ||
                 !m->shaded_depth || !m->clear_vertex || !m->clear_color || !m->clear_depth ||
-                !m->clear || !m->pipelines || !m->samplers || !m->depth_states ||
+                !m->clear || !m->pack_depth || !m->pipelines || !m->samplers || !m->depth_states ||
                 !m->inflight || !m->visibility || !m->white || !m->white_cube ||
                 !m->white_sampler) {
                 fail(m, Failure::Shader, "entry points or renderer resources", error, false);

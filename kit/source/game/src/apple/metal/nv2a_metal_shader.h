@@ -69,6 +69,8 @@ struct Guest {
     float4 factor0[8], factor1[8], texInfo[4];
     uint4 textureControl;
     float4 bumpMatrix[4], bumpLuminance[4], eyeVector, textureBias, misc;
+    float4 borderColor[4];
+    uint4 borderMode;
 };
 
 // Mirrors the 2D texture-stage and combiner path in nv2a_gpu_shader.h.
@@ -111,10 +113,29 @@ float4 texture_sample(uint stage, float3 c, bool cube, constant Guest &g,
         return cube3.sample(smp3, d, bias(g.textureBias[3]));
     }
     float2 uv = (cube ? cube_as_2d(c) : c.xy) * g.texInfo[stage].xy;
-    if (stage == 0) return tex0.sample(smp0, uv, bias(g.textureBias[0]));
-    if (stage == 1) return tex1.sample(smp1, uv, bias(g.textureBias[1]));
-    if (stage == 2) return tex2.sample(smp2, uv, bias(g.textureBias[2]));
-    return tex3.sample(smp3, uv, bias(g.textureBias[3]));
+    float4 color;
+    float2 size;
+    if (stage == 0) { color = tex0.sample(smp0, uv, bias(g.textureBias[0])); size = float2(tex0.get_width(), tex0.get_height()); }
+    else if (stage == 1) { color = tex1.sample(smp1, uv, bias(g.textureBias[1])); size = float2(tex1.get_width(), tex1.get_height()); }
+    else if (stage == 2) { color = tex2.sample(smp2, uv, bias(g.textureBias[2])); size = float2(tex2.get_width(), tex2.get_height()); }
+    else { color = tex3.sample(smp3, uv, bias(g.textureBias[3])); size = float2(tex3.get_width(), tex3.get_height()); }
+    uint mode = g.borderMode[stage];
+    if (!mode) return color;
+    // The sampler's border is transparent black, so color holds only the
+    // texels inside the texture; the border colour takes the remaining
+    // filter weight, per texel as the CPU and D3D11 samplers apply it.
+    float coverage = 1;
+    for (uint axis = 0; axis < 2; ++axis) {
+        if (!(mode & (1u << axis))) continue;
+        float x = uv[axis] * size[axis], n = size[axis];
+        if (mode & 4u) {
+            float t = x - 0.5f, x0 = floor(t), f = t - x0;
+            coverage *= (x0 >= 0 && x0 < n ? 1 - f : 0) + (x0 + 1 >= 0 && x0 + 1 < n ? f : 0);
+        } else {
+            coverage *= x >= 0 && x < n ? 1.0f : 0.0f;
+        }
+    }
+    return color + g.borderColor[stage] * (1 - coverage);
 }
 
 float3 signed_dot_map(float3 v, uint mode)
@@ -362,6 +383,24 @@ fragment DepthOutput ma2_clear_depth(ClearVarying in [[stage_in]],
     out.color = c.color;
     out.depth = c.depth.x;
     return out;
+}
+
+// A Z24S8 surface as the guest's dwords (z << 8 | stencil), from the depth
+// and stencil planes a blit wrote to buffers. round(d * (2^24 - 1)) is taken
+// exactly: d * 2^24 is exact in float, so only the fraction is rounded.
+struct DepthPack { uint width, height; };
+kernel void ma2_pack_depth(device const float *depth [[buffer(0)]],
+                           device const uchar *stencil [[buffer(1)]],
+                           device uint *out [[buffer(2)]],
+                           constant DepthPack &k [[buffer(3)]],
+                           uint2 p [[thread_position_in_grid]])
+{
+    if (p.x >= k.width || p.y >= k.height) return;
+    uint i = p.y * k.width + p.x;
+    float d = clamp(depth[i], 0.0f, 1.0f);
+    float x = d * 16777216.0f, whole = floor(x);
+    float z = whole + floor((x - whole) - d + 0.5f);
+    out[i] = (uint(clamp(z, 0.0f, 16777215.0f)) << 8) | stencil[i];
 }
 
 struct Clear {

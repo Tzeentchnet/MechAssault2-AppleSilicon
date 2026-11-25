@@ -809,6 +809,21 @@ static bool texture_sampler_tests(Ma2MetalRenderer *renderer)
     CHECK(expect_texture_draw(renderer, s, v, fixture_texel, 0xffffffffu));
     s.textures[0].border_color = 0;
     CHECK(expect_texture_draw(renderer, s, v, fixture_texel, 0u));
+    // Any other border colour: blended in the shader by filter coverage.
+    s.textures[0].border_color = 0x80402010;
+    CHECK(expect_texture_draw(renderer, s, v, fixture_texel, 0x80402010u));
+    s.textures[0].filter = 0x02020000;
+    for (auto &vertex : v) {
+        vertex.tex[0][0] = 4.0f; vertex.tex[0][1] = 1.5f;  // half on texel (3,1), half border
+    }
+    CHECK(nv2a_dispatch_draw(&s, v, 3, 5, fixture_texel));
+    uint32_t half = read32(COLOR, 80, 4, 3);
+    auto channel = [&](unsigned shift) { return (int)((half >> shift) & 255); };
+    if (std::abs(channel(24) - 191) > 1 || std::abs(channel(16) - 128) > 1 ||
+        std::abs(channel(8) - 48) > 1 || std::abs(channel(0) - 25) > 1)
+        std::fprintf(stderr, "half border: got %08x\n", half);
+    CHECK(std::abs(channel(24) - 191) <= 1 && std::abs(channel(16) - 128) <= 1);
+    CHECK(std::abs(channel(8) - 48) <= 1 && std::abs(channel(0) - 25) <= 1);
 
     s.textures[0] = fixture_texture(3);
     fixture_vertices(v);
@@ -1003,7 +1018,8 @@ static bool texture_decline_tests(Ma2MetalRenderer *renderer)
     DECLINE_TEXTURE(bad.textures[0].cube = 1);
     DECLINE_TEXTURE(bad.textures[0].dimensionality = 3);
     DECLINE_TEXTURE(bad.textures[0].color = 0x12; bad.textures[0].pitch = 15);
-    DECLINE_TEXTURE(bad.textures[0].addr_u = 4; bad.textures[0].border_color = 0xff123456);
+    DECLINE_TEXTURE(bad.textures[0].addr_u = 4; bad.textures[0].border_color = 0xff123456;
+                    bad.textures[0].filter = 0x01030000);
     DECLINE_TEXTURE(bad.textures[0].filter = 0x02020000; bad.textures[0].control0 = 0x10);
     DECLINE_TEXTURE(bad.textures[0].filter = 0x01030000; bad.textures[0].levels = 4);
     DECLINE_TEXTURE(bad.textures[2].offset = 0xfffffff0);
@@ -1083,6 +1099,54 @@ static bool g8b8_tests(Ma2MetalRenderer *renderer)
     CHECK(read16(OTHER, 40, 4, 3) == 0x1200u);
 
     CHECK(submitted(renderer) > count);
+    CHECK(!nv2a_dispatch_failed());
+    return true;
+}
+
+/* Render to texture: a linear texture that is exactly a resident colour
+ * surface is copied on the GPU, with no write-back wait and no texel
+ * decode (the texel callback fails if it is ever called). */
+static bool render_to_texture_tests(Ma2MetalRenderer *renderer)
+{
+    Nv2aGpuState target = state();
+    target.color_va = OTHER; target.pitch = 16; target.bpp = 4; target.format = 0x128;
+    target.clip_x = 0; target.clip_y = 0; target.clip_w = 4; target.clip_h = 4;
+    CHECK(nv2a_dispatch_clear(&target, 0xf0, 0x80402010, 0));
+
+    Nv2aGpuState s = fixture_state();
+    Nv2aVshOutput v[3];
+    fixture_vertices(v);
+    s.use_rc = 0; s.textured = 1; s.legacy = 1;
+    s.textures[0] = fixture_texture(1);
+    s.textures[0].offset = OTHER; s.textures[0].pitch = 16; s.textures[0].color = 0x12;
+    for (auto &vertex : v) {
+        vertex.tex[0][0] = vertex.tex[0][1] = 1;
+        vertex.tex[0][3] = 1;
+    }
+    CHECK(expect_texture_draw(renderer, s, v, failing_texel, 0x80402010u));
+    s.textures[0].color = 0x1E;
+    CHECK(expect_texture_draw(renderer, s, v, failing_texel, 0xff402010u));
+    // New contents reach the next sample (the copy follows the surface).
+    CHECK(nv2a_dispatch_clear(&target, 0xf0, 0x11223344, 0));
+    s.textures[0].color = 0x12;
+    CHECK(expect_texture_draw(renderer, s, v, failing_texel, 0x11223344u));
+
+    target.color_va = DEPTH2; target.pitch = 8; target.bpp = 2; target.format = 0x12a;
+    CHECK(nv2a_dispatch_clear(&target, 0xf0, 0xff123456, 0));
+    s.textures[0].offset = DEPTH2; s.textures[0].pitch = 8; s.textures[0].color = 0x17;
+    CHECK(expect_texture_draw(renderer, s, v, failing_texel, 0xff003456u));
+
+    // A Z24S8 depth surface read as LIN_A8R8G8B8: the guest's z << 8 | stencil.
+    Nv2aGpuState z = state();
+    z.color_va = OTHER; z.pitch = 16; z.depth_va = DEPTH; z.depth_pitch = 16; z.format = 0x128;
+    z.clip_x = 0; z.clip_y = 0; z.clip_w = 4; z.clip_h = 4; z.stencil_clear = 0x5a;
+    s.textures[0].offset = DEPTH; s.textures[0].pitch = 16; s.textures[0].color = 0x12;
+    for (uint32_t value : {12345u, 8388607u, 16777215u, 1u}) {
+        CHECK(nv2a_dispatch_clear(&z, 3, 0, (float)value));
+        CHECK(expect_texture_draw(renderer, s, v, failing_texel, (value << 8) | 0x5au));
+    }
+    s.textures[0].color = 0x1E;
+    CHECK(expect_texture_draw(renderer, s, v, failing_texel, 0xff00015au));
     CHECK(!nv2a_dispatch_failed());
     return true;
 }
@@ -1532,7 +1596,8 @@ int main(int argc, char **argv)
         ok = texture_tests(renderer) && texture_stage_tests(renderer) &&
              texture_combiner_tests(renderer) && texture_sampler_tests(renderer) &&
              texture_decoder_tests(renderer) && textured_alpha_depth_tests(renderer) &&
-             texture_decline_tests(renderer) && !nv2a_dispatch_failed();
+             texture_decline_tests(renderer) && render_to_texture_tests(renderer) &&
+             !nv2a_dispatch_failed();
     }
     else if (argc == 2 && std::strcmp(argv[1], "alias-clear") == 0)
         ok = alias_failure_test(renderer, errors[0], false);
