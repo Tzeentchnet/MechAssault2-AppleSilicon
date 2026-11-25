@@ -72,13 +72,20 @@ struct Guest {
 };
 
 // Mirrors the 2D texture-stage and combiner path in nv2a_gpu_shader.h.
+// A stage holding a guest cube map binds it at texture(4 + stage) and sets
+// texInfo.w; every other stage samples its 2D texture.
 #define MA2_TEXTURE_PARAMS \
     texture2d<float> tex0, texture2d<float> tex1, texture2d<float> tex2, texture2d<float> tex3, \
+    texturecube<float> cube0, texturecube<float> cube1, texturecube<float> cube2, \
+    texturecube<float> cube3, \
     sampler smp0, sampler smp1, sampler smp2, sampler smp3
-#define MA2_TEXTURE_ARGS tex0, tex1, tex2, tex3, smp0, smp1, smp2, smp3
+#define MA2_TEXTURE_ARGS tex0, tex1, tex2, tex3, cube0, cube1, cube2, cube3, \
+    smp0, smp1, smp2, smp3
 #define MA2_TEXTURE_BINDINGS \
     texture2d<float> tex0 [[texture(0)]], texture2d<float> tex1 [[texture(1)]], \
     texture2d<float> tex2 [[texture(2)]], texture2d<float> tex3 [[texture(3)]], \
+    texturecube<float> cube0 [[texture(4)]], texturecube<float> cube1 [[texture(5)]], \
+    texturecube<float> cube2 [[texture(6)]], texturecube<float> cube3 [[texture(7)]], \
     sampler smp0 [[sampler(0)]], sampler smp1 [[sampler(1)]], \
     sampler smp2 [[sampler(2)]], sampler smp3 [[sampler(3)]]
 
@@ -96,6 +103,13 @@ float4 texture_sample(uint stage, float3 c, bool cube, constant Guest &g,
                       MA2_TEXTURE_PARAMS)
 {
     if (!g.texInfo[stage].z) return 1.0f;
+    if (cube && g.texInfo[stage].w != 0) {
+        float3 d = all(c == 0.0f) ? float3(1, 0, 0) : c;
+        if (stage == 0) return cube0.sample(smp0, d, bias(g.textureBias[0]));
+        if (stage == 1) return cube1.sample(smp1, d, bias(g.textureBias[1]));
+        if (stage == 2) return cube2.sample(smp2, d, bias(g.textureBias[2]));
+        return cube3.sample(smp3, d, bias(g.textureBias[3]));
+    }
     float2 uv = (cube ? cube_as_2d(c) : c.xy) * g.texInfo[stage].xy;
     if (stage == 0) return tex0.sample(smp0, uv, bias(g.textureBias[0]));
     if (stage == 1) return tex1.sample(smp1, uv, bias(g.textureBias[1]));
@@ -321,6 +335,32 @@ fragment DepthOutput ma2_shaded_depth(Varying in [[stage_in]],
     out.color = pixel_color(in, g, MA2_TEXTURE_ARGS);
     out.depth = round(clamp(in.position.z, 0.0, 1.0) * viewport.depth_max)
                 / viewport.depth_max;
+    return out;
+}
+
+// Resident-target clears: one triangle covers the viewport, which the
+// renderer sets to the clipped clear rectangle. Values arrive exact: colour
+// as unorm8/255 and depth as integer/depth_max.
+struct ClearVarying { float4 position [[position]]; };
+vertex ClearVarying ma2_clear_vertex(uint id [[vertex_id]])
+{
+    float2 p = float2((id << 1) & 2, id & 2);
+    ClearVarying out;
+    out.position = float4(p * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+struct ClearValue { float4 color; float4 depth; };
+fragment float4 ma2_clear_color(ClearVarying in [[stage_in]],
+                                constant ClearValue &c [[buffer(0)]])
+{
+    return c.color;
+}
+fragment DepthOutput ma2_clear_depth(ClearVarying in [[stage_in]],
+                                     constant ClearValue &c [[buffer(0)]])
+{
+    DepthOutput out;
+    out.color = c.color;
+    out.depth = c.depth.x;
     return out;
 }
 

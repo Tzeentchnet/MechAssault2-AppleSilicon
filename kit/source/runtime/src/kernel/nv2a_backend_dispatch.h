@@ -11,6 +11,10 @@ int nv2a_dispatch_registered(void);
 uint64_t nv2a_dispatch_registration_epoch(void);
 #endif
 int nv2a_dispatch_failed(void);
+/* Exact visibility results; see Nv2aBackend.visibility_count. */
+int nv2a_dispatch_visibility(void);
+void nv2a_dispatch_visibility_reset(void);
+uint32_t nv2a_dispatch_visibility_count(void);
 /* A backend that has issued work and cannot complete it must discard the
  * frame rather than returning an unsupported-state result to the CPU path. */
 void nv2a_dispatch_report_failure(const char *operation);

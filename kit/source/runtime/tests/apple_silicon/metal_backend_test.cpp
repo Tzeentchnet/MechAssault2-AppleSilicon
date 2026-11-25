@@ -16,11 +16,13 @@ extern "C" {
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <vector>
 #include <fcntl.h>
 #include <unistd.h>
 
 extern "C" void nv2a_pb_exec_method(uint32_t, uint32_t, uint32_t);
 extern "C" void *xbox_FramebufferWindowHandle(void);
+extern "C" uint32_t xbox_ContiguousAllocatedBytes(void);
 
 #define CHECK(expr) do { \
     if (!(expr)) { \
@@ -35,9 +37,22 @@ enum : uint32_t {
     FRAME_RENDER = 0x80100000u, FRAME_SCANOUT = 0x80300000u
 };
 
+/* The renderer keeps surfaces on the GPU. Like the executor around CPU
+ * access, publish them before touching guest RAM and have the renderer
+ * reload anything the test then writes. */
 static uint8_t *memory(uint32_t va, size_t size)
 {
+    nv2a_dispatch_sync_all();
+    for (uint32_t surface : {COLOR, DEPTH, DEPTH2, OTHER, FRAME_RENDER, FRAME_SCANOUT})
+        nv2a_dispatch_invalidate(surface);
     return static_cast<uint8_t *>(xbox_TranslateMappedRam(va, size));
+}
+
+/* Submissions after completing everything encoded so far. */
+static uint64_t submitted(Ma2MetalRenderer *renderer)
+{
+    nv2a_dispatch_sync_all();
+    return ma2_metal_test_submission_count(renderer);
 }
 
 static uint32_t read32(uint32_t va, uint32_t pitch, unsigned x, unsigned y)
@@ -131,6 +146,41 @@ static bool clear_tests()
     CHECK(read16(DEPTH, 24, 3, 2) == 40000);
     CHECK(nv2a_dispatch_clear(&s, 2, 0, 0));
     CHECK(read16(DEPTH, 24, 3, 2) == 40000);
+    return true;
+}
+
+/* Stencil stays resident beside Z24S8 depth and round-trips through guest
+ * RAM: mark a triangle with INCR_WRAP, then draw only where stencil == 1. */
+static bool stencil_tests()
+{
+    Nv2aGpuState s = state();
+    s.pitch = 80; s.depth_pitch = 96; s.clip_x = 2; s.clip_y = 1; s.clip_w = 12; s.clip_h = 10;
+    s.stencil_clear = 0;
+    CHECK(nv2a_dispatch_clear(&s, 0xf3, 0xff000000, 16777215.0f));
+    Nv2aVshOutput v[3];
+    make_triangle(v, 1000, 1, 1, 1, 1);
+    s.stencil_test = 1; s.stencil_func = 0x207; s.stencil_ref = 0;
+    s.stencil_read_mask = s.stencil_write_mask = 0xff;
+    s.stencil_fail = s.stencil_zfail = 0x1e00; s.stencil_zpass = 0x8507;
+    s.color_mask = 0;
+    CHECK(nv2a_dispatch_draw(&s, v, 3, 5, nullptr));
+    CHECK((read32(DEPTH, 96, 4, 3) & 255u) == 1);
+    CHECK((read32(DEPTH, 96, 12, 9) & 255u) == 0);
+    CHECK(read32(COLOR, 80, 4, 3) == 0xff000000u);
+
+    Nv2aVshOutput quad[4];
+    std::memset(quad, 0, sizeof(quad));
+    const float corners[4][2] = {{2, 1}, {14, 1}, {14, 11}, {2, 11}};
+    for (unsigned i = 0; i < 4; ++i) {
+        quad[i].pos[0] = corners[i][0]; quad[i].pos[1] = corners[i][1]; quad[i].pos[3] = 1;
+        quad[i].d0[0] = quad[i].d0[3] = 1;
+    }
+    s.color_mask = 0x01010101u;
+    s.stencil_func = 0x202; s.stencil_ref = 1; s.stencil_zpass = 0x1e00;
+    CHECK(nv2a_dispatch_draw(&s, quad, 4, 8, nullptr));
+    CHECK(read32(COLOR, 80, 4, 3) == 0xffff0000u);
+    CHECK(read32(COLOR, 80, 12, 9) == 0xff000000u);
+    CHECK(!nv2a_dispatch_failed());
     return true;
 }
 
@@ -365,6 +415,10 @@ static Nv2aGpuState fixture_state()
     s.pitch = 80; s.clip_x = 2; s.clip_y = 1; s.clip_w = 12; s.clip_h = 10;
     s.use_rc = 1;
     for (unsigned i = 0; i < 4; ++i) s.textures[i] = fixture_texture(i + 1);
+    /* LINEAR fog with px = py = 1 makes the factor equal oFog, so fixtures
+     * can state the combiner's fog input directly. */
+    s.fog_enable = 1; s.fog_mode = 0x2601;
+    s.fog_params[0] = s.fog_params[1] = 1;
     return s;
 }
 
@@ -382,9 +436,9 @@ static void fixture_vertices(Nv2aVshOutput (&v)[3])
 static bool expect_texture_draw(Ma2MetalRenderer *renderer, Nv2aGpuState &s,
                                 Nv2aVshOutput (&v)[3], Nv2aGpuTexel texel, uint32_t expected)
 {
-    uint64_t before = ma2_metal_test_submission_count(renderer);
+    uint64_t before = submitted(renderer);
     CHECK(nv2a_dispatch_draw(&s, v, 3, 5, texel));
-    CHECK(ma2_metal_test_submission_count(renderer) == before + 1);
+    CHECK(submitted(renderer) == before + 1);
     uint32_t actual = read32(COLOR, 80, 4, 3);
     if (actual != expected)
         std::fprintf(stderr, "pixel: got %08x, expected %08x\n", actual, expected);
@@ -403,9 +457,9 @@ static bool texture_tests(Ma2MetalRenderer *renderer)
     s.rc.other_stage_input = 0x11;
     s.rc.final0 = 0x0000000a;
     s.rc.final1 = 0x00001a00;
-    uint64_t before = ma2_metal_test_submission_count(renderer);
+    uint64_t before = submitted(renderer);
     CHECK(nv2a_dispatch_draw(&s, v, 3, 5, fixture_texel));
-    CHECK(ma2_metal_test_submission_count(renderer) == before + 1);
+    CHECK(submitted(renderer) == before + 1);
     CHECK(read32(COLOR, 80, 4, 3) == 0xff808022u);
     CHECK(fixture_texel_calls[1] == 16 && fixture_texel_calls[2] == 0 &&
           fixture_texel_calls[3] == 16);
@@ -417,12 +471,25 @@ static bool texture_tests(Ma2MetalRenderer *renderer)
     s.rc.alpha_icw[0] = 0x19140000;
     s.rc.color_ocw[0] = s.rc.alpha_ocw[0] = 0xc0;
     std::memset(fixture_texel_calls, 0, sizeof(fixture_texel_calls));
-    before = ma2_metal_test_submission_count(renderer);
+    before = submitted(renderer);
     CHECK(nv2a_dispatch_draw(&s, v, 3, 5, fixture_texel));
-    CHECK(ma2_metal_test_submission_count(renderer) == before + 1);
+    CHECK(submitted(renderer) == before + 1);
     CHECK(read32(COLOR, 80, 4, 3) == 0xffc02000u);
-    CHECK(fixture_texel_calls[1] == 16 && fixture_texel_calls[2] == 16 &&
+    /* Stage 0 reuses the first draw's texture: same descriptor, same guest
+     * bytes. Stage 1 is new. */
+    CHECK(fixture_texel_calls[1] == 0 && fixture_texel_calls[2] == 16 &&
           fixture_texel_calls[3] == 0);
+
+    /* Changing the guest bytes behind a cached texture must decode again. */
+    uint8_t *texture_bytes = memory(1, 64);
+    CHECK(texture_bytes);
+    texture_bytes[0] ^= 0xff;
+    std::memset(fixture_texel_calls, 0, sizeof(fixture_texel_calls));
+    CHECK(nv2a_dispatch_draw(&s, v, 3, 5, fixture_texel));
+    CHECK(read32(COLOR, 80, 4, 3) == 0xffc02000u);
+    CHECK(fixture_texel_calls[1] == 16 && fixture_texel_calls[2] == 0);
+    texture_bytes = memory(1, 64);
+    texture_bytes[0] ^= 0xff;
     return true;
 }
 
@@ -923,7 +990,7 @@ static bool texture_decline_tests(Ma2MetalRenderer *renderer)
     s.rc.final0 = 10; s.rc.final1 = 0x1a00;
     uint8_t before[80 * 12];
     std::memcpy(before, memory(COLOR, sizeof(before)), sizeof(before));
-    uint64_t submissions = ma2_metal_test_submission_count(renderer);
+    uint64_t submissions = submitted(renderer);
     uint64_t commands = ma2_metal_test_command_count(renderer);
     std::memset(fixture_texel_calls, 0, sizeof(fixture_texel_calls));
 #define DECLINE_TEXTURE(...) do { Nv2aGpuState bad = s; __VA_ARGS__; \
@@ -952,10 +1019,13 @@ static bool texture_decline_tests(Ma2MetalRenderer *renderer)
     v[0].d1[0] = std::numeric_limits<float>::infinity();
     CHECK(!nv2a_dispatch_draw(&s, v, 3, 5, fixture_texel));
     fixture_vertices(v);
+    // New guest bytes behind both stages, so neither is a cache hit.
+    memory(4, 1)[0] ^= 0x5a;
     failing_texel_calls = 0;
     CHECK(!nv2a_dispatch_draw(&s, v, 3, 5, failing_texel));
     CHECK(failing_texel_calls == 17);
-    CHECK(ma2_metal_test_submission_count(renderer) == submissions);
+    memory(4, 1)[0] ^= 0x5a;
+    CHECK(submitted(renderer) == submissions);
     CHECK(ma2_metal_test_command_count(renderer) == commands);
     CHECK(std::memcmp(before, memory(COLOR, sizeof(before)), sizeof(before)) == 0);
     CHECK(!nv2a_dispatch_failed());
@@ -969,7 +1039,7 @@ static bool unsupported_tests(Ma2MetalRenderer *renderer)
     make_triangle(v, 0, 1, 1, 1, 1);
     uint8_t before[40 * 8];
     std::memcpy(before, memory(COLOR, sizeof(before)), sizeof(before));
-    uint64_t count = ma2_metal_test_submission_count(renderer);
+    uint64_t count = submitted(renderer);
 #define DECLINE(field, value) do { Nv2aGpuState bad = s; bad.field = value; \
     CHECK(!nv2a_dispatch_draw(&bad, v, 3, 5, nullptr)); } while (0)
     DECLINE(textured, 1);
@@ -1000,10 +1070,10 @@ static bool unsupported_tests(Ma2MetalRenderer *renderer)
     bad.clip_min = 0; bad.clip_max = 16777216.0f;
     CHECK(!nv2a_dispatch_draw(&bad, v, 3, 5, nullptr));
     CHECK(!nv2a_dispatch_draw(&s, v, 3, 2, nullptr));
-    v[0].pos[3] = 0;
+    v[0].pos[0] = std::numeric_limits<float>::quiet_NaN();
+    v[0].d0[0] = std::numeric_limits<float>::infinity();
     CHECK(!nv2a_dispatch_draw(&s, v, 3, 5, nullptr));
-    v[0].pos[3] = 1; v[0].pos[0] = std::numeric_limits<float>::quiet_NaN();
-    CHECK(!nv2a_dispatch_draw(&s, v, 3, 5, nullptr));
+    v[0].d0[0] = 1;
     CHECK(!nv2a_dispatch_clear(&s, 0x100, 0, 0));
     bad = s; bad.format = 0x228;
     CHECK(!nv2a_dispatch_clear(&bad, 0xf0, 0, 0));
@@ -1015,8 +1085,19 @@ static bool unsupported_tests(Ma2MetalRenderer *renderer)
     CHECK(!nv2a_dispatch_clear(&bad, 0xf0, 0, 0));
     CHECK(!nv2a_dispatch_draw(&bad, v, 3, 5, nullptr));
     g_xbox_image_lo = old_lo; g_xbox_image_hi = old_hi;
-    CHECK(ma2_metal_test_submission_count(renderer) == count);
+    CHECK(submitted(renderer) == count);
     CHECK(std::memcmp(before, memory(COLOR, sizeof(before)), sizeof(before)) == 0);
+
+    /* The CPU path culls a triangle whose position is not finite: handled,
+     * with no GPU work. A vertex on or behind the eye plane is clipped by
+     * Metal as the CPU's homogeneous clipper would, so it is not declined. */
+    v[0].pos[0] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(nv2a_dispatch_draw(&s, v, 3, 5, nullptr));
+    CHECK(submitted(renderer) == count);
+    v[0].pos[0] = 3; v[0].pos[3] = 0;
+    CHECK(nv2a_dispatch_draw(&s, v, 3, 5, nullptr));
+    v[0].pos[3] = -1;
+    CHECK(nv2a_dispatch_draw(&s, v, 3, 5, nullptr));
     CHECK(!nv2a_dispatch_failed());
     return true;
 }
@@ -1043,6 +1124,19 @@ static void submit_program_triangle(float z, float r, float g, float b, float le
     submit_program_vertices(vertices);
 }
 
+/* GET_REPORT through the executor; returns the reported sample count. */
+static uint32_t report_count()
+{
+    constexpr uint32_t offset = 0x000c0000u;
+    uint32_t va = offset < xbox_ContiguousAllocatedBytes() ? 0x80000000u + offset : offset;
+    std::memset(memory(va, 16), 0xff, 16);
+    pb(0x17d0, offset);
+    uint32_t count = 0, status = 0;
+    std::memcpy(&count, memory(va, 16) + 8, 4);
+    std::memcpy(&status, memory(va, 16) + 12, 4);
+    return status == 0 ? count : UINT32_MAX;
+}
+
 static void setup_program()
 {
     /* MOV oPos,v0; MOV oD0,v3, with identity swizzles. */
@@ -1067,18 +1161,18 @@ static bool executor_tests(Ma2MetalRenderer *renderer)
     pb(0x1d90, 0xff000000); pb(0x1d8c, 0xffffff5a);
     pb(0x1d94, 0xf3);
     setup_program();
-    uint64_t before = ma2_metal_test_submission_count(renderer);
+    uint64_t before = submitted(renderer);
     submit_program_triangle(1000, 1, 0, 0);
-    CHECK(ma2_metal_test_submission_count(renderer) == before + 1);
+    CHECK(submitted(renderer) == before + 1);
     CHECK(read32(COLOR, 80, 4, 3) == 0xffff0000u);
     CHECK(read32(DEPTH, 96, 4, 3) == ((1000u << 8) | 0x5au));
 
     /* Alpha testing is deliberately unsupported by Metal; its software
      * fallback must see the GPU's depth and publish its own Z writes. */
     pb(0x0300, 1); pb(0x033c, 0x207); pb(0x0340, 0);
-    before = ma2_metal_test_submission_count(renderer);
+    before = submitted(renderer);
     submit_program_triangle(2000, 0, 0, 1);
-    CHECK(ma2_metal_test_submission_count(renderer) == before);
+    CHECK(submitted(renderer) == before);
     CHECK(read32(COLOR, 80, 4, 3) == 0xffff0000u);
     submit_program_triangle(500, 0, 0, 1);
     CHECK(read32(COLOR, 80, 4, 3) == 0xff0000ffu);
@@ -1119,20 +1213,33 @@ static bool executor_tests(Ma2MetalRenderer *renderer)
     pb(0x0308, 0);
     pb(0x0300, 0); pb(0x030c, 1);
 
-    /* Visibility reports are not in the backend descriptor. Keep those
-     * batches on the CPU instead of claiming an uncounted hardware draw. */
-    pb(0x17cc, 1);
-    before = ma2_metal_test_submission_count(renderer);
-    submit_program_triangle(100, 1, 1, 0);
-    CHECK(ma2_metal_test_submission_count(renderer) == before);
-    CHECK(read32(DEPTH, 96, 4, 3) == ((100u << 8) | 0x5au));
+    /* Visibility tests run on Metal with exact sample counts. The report
+     * must equal the pixels the counted draw changed, and a draw that the
+     * depth test rejects everywhere must count nothing. */
+    pb(0x1d90, 0xff000000); pb(0x1d8c, 0xffffff5a); pb(0x1d94, 0xf3);
+    pb(0x17c8, 0); pb(0x17cc, 1);
+    before = submitted(renderer);
+    submit_program_triangle(100, 1, 0, 1);
+    CHECK(submitted(renderer) == before + 1);
     pb(0x17cc, 0);
+    CHECK(read32(DEPTH, 96, 4, 3) == ((100u << 8) | 0x5au));
+    uint32_t covered = 0;
+    for (unsigned y = 0; y < 12; ++y)
+        for (unsigned x = 0; x < 20; ++x)
+            covered += read32(COLOR, 80, x, y) == 0xffff00ffu;
+    CHECK(covered > 0);
+    CHECK(report_count() == covered);
+    pb(0x17c8, 0); pb(0x17cc, 1);
+    submit_program_triangle(100, 0, 1, 1);
+    pb(0x17cc, 0);
+    CHECK(report_count() == 0);
+    CHECK(read32(COLOR, 80, 4, 3) == 0xffff00ffu);
     uint32_t outside_color = read32(COLOR, 80, 6, 3);
     uint32_t outside_depth = read32(DEPTH, 96, 6, 3);
     pb(0x1d98, (5u << 16) | 3); pb(0x1d9c, (4u << 16) | 2);
     pb(0x1d90, 0xff220000); pb(0x1d8c, (600u << 8) | 0x5a);
     pb(0x1d94, 0x11);
-    CHECK(read32(COLOR, 80, 4, 3) == 0xff22ff00u);
+    CHECK(read32(COLOR, 80, 4, 3) == 0xff2200ffu);
     CHECK(read32(DEPTH, 96, 4, 3) == ((600u << 8) | 0x5au));
     CHECK(read32(COLOR, 80, 6, 3) == outside_color);
     CHECK(read32(DEPTH, 96, 6, 3) == outside_depth);
@@ -1151,9 +1258,9 @@ static bool interop_failure_test(Ma2MetalRenderer *renderer, int error_fd)
     uint8_t before[4096];
     std::memcpy(before, memory(0x10000, sizeof(before)), sizeof(before));
     g_xbox_image_lo = 0x10000; g_xbox_image_hi = 0x11000;
-    uint64_t count = ma2_metal_test_submission_count(renderer);
+    uint64_t count = submitted(renderer);
     submit_program_triangle(500, 0, 0, 1);
-    CHECK(ma2_metal_test_submission_count(renderer) == count);
+    CHECK(submitted(renderer) == count);
     CHECK(nv2a_dispatch_failed() && nv2a_dispatch_discard_frame());
     CHECK(ma2_metal_last_error(renderer) && std::strstr(ma2_metal_last_error(renderer), "depth mapping"));
     CHECK(std::memcmp(before, memory(0x10000, sizeof(before)), sizeof(before)) == 0);
@@ -1171,9 +1278,9 @@ static bool color_failure_test(Ma2MetalRenderer *renderer, int error_fd)
     pb(0x0200, (12u << 16) | 2); pb(0x0204, (10u << 16) | 1);
     pb(0x0208, 0x128); pb(0x020c, (96u << 16) | 80u);
     pb(0x0210, 0x08010000u); pb(0x1d90, 0xffabcdef);
-    uint64_t count = ma2_metal_test_submission_count(renderer);
+    uint64_t count = submitted(renderer);
     pb(0x1d94, 0xf0);
-    CHECK(ma2_metal_test_submission_count(renderer) == count);
+    CHECK(submitted(renderer) == count);
     CHECK(nv2a_dispatch_failed() && nv2a_dispatch_discard_frame());
     CHECK(ma2_metal_last_error(renderer) && std::strstr(ma2_metal_last_error(renderer), "color mapping"));
     CHECK(std::memcmp(before, memory(0x10000, sizeof(before)), sizeof(before)) == 0);
@@ -1191,7 +1298,7 @@ static bool alias_failure_test(Ma2MetalRenderer *renderer, int error_fd, bool dr
     pb(0x0200, (12u << 16) | 2); pb(0x0204, (10u << 16) | 1);
     pb(0x0208, 0x128); pb(0x020c, (96u << 16) | 80u);
     pb(0x0210, COLOR); pb(0x0214, 0xf0020000u);
-    uint64_t count = ma2_metal_test_submission_count(renderer);
+    uint64_t count = submitted(renderer);
     if (draw) {
         setup_program();
         submit_program_triangle(500, 1, 0, 0);
@@ -1199,7 +1306,7 @@ static bool alias_failure_test(Ma2MetalRenderer *renderer, int error_fd, bool dr
         pb(0x1d90, 0xffabcdef); pb(0x1d8c, 0x12345678);
         pb(0x1d94, 0xf3);
     }
-    CHECK(ma2_metal_test_submission_count(renderer) == count);
+    CHECK(submitted(renderer) == count);
     CHECK(nv2a_dispatch_failed() && nv2a_dispatch_discard_frame());
     CHECK(ma2_metal_last_error(renderer) && std::strstr(ma2_metal_last_error(renderer), "surface overlap"));
     CHECK(std::memcmp(before, memory(COLOR, sizeof(before)), sizeof(before)) == 0);
@@ -1218,12 +1325,12 @@ static bool mixed_depth_test(Ma2MetalRenderer *renderer, int error_fd, bool nonl
     pb(0x0208, nonlinear_first ? swizzled : linear);
     pb(0x1d8c, 0x12345678); pb(0x1d94, 1);
     CHECK(!nv2a_dispatch_failed());
-    uint64_t count = ma2_metal_test_submission_count(renderer);
+    uint64_t count = submitted(renderer);
     uint8_t before[96 * 12];
     std::memcpy(before, memory(DEPTH, sizeof(before)), sizeof(before));
     pb(0x0208, nonlinear_first ? linear : swizzled);
     pb(0x1d8c, 0xabcdef12); pb(0x1d94, 1);
-    CHECK(ma2_metal_test_submission_count(renderer) == count);
+    CHECK(submitted(renderer) == count);
     CHECK(nv2a_dispatch_failed() && nv2a_dispatch_discard_frame());
     CHECK(ma2_metal_last_error(renderer) && std::strstr(ma2_metal_last_error(renderer), "mixed linear"));
     CHECK(std::memcmp(before, memory(DEPTH, sizeof(before)), sizeof(before)) == 0);
@@ -1247,10 +1354,14 @@ static bool presenter_test()
     nv2a_pb_set_scanout(FRAME_SCANOUT, pitch);
     pb(0x0130, 0);
     CHECK(xbox_FramebufferHostPump(10) == 1);
-    uint32_t pixels[64 * 48];
     SDL_Renderer *sdl = SDL_GetRenderer(static_cast<SDL_Window *>(xbox_FramebufferWindowHandle()));
-    CHECK(sdl && SDL_RenderReadPixels(sdl, nullptr, SDL_PIXELFORMAT_ARGB8888, pixels, 64 * 4) == 0);
-    CHECK((pixels[0] & 0x00ffffffu) == 0x0000ff00u);
+    int width = 0, height = 0;
+    CHECK(sdl && SDL_GetRendererOutputSize(sdl, &width, &height) == 0 && width > 0 && height > 0);
+    // The output is larger than the logical 64x48 window on a HiDPI display.
+    std::vector<uint32_t> pixels((size_t)width * height);
+    CHECK(SDL_RenderReadPixels(sdl, nullptr, SDL_PIXELFORMAT_ARGB8888, pixels.data(), width * 4) == 0);
+    std::fprintf(stderr, "output %dx%d first %08x centre %08x\n", width, height, pixels[0], pixels[(size_t)(height / 2) * width + width / 2]);
+    CHECK((pixels[(size_t)(height / 2) * width + width / 2] & 0x00ffffffu) == 0x0000ff00u);
     xbox_FramebufferHostClose();
     return true;
 }
@@ -1264,6 +1375,8 @@ static bool failure_test(Ma2MetalRenderer *renderer, Nv2aBackend &backend, int e
     std::memcpy(depth_before, memory(DEPTH, sizeof(depth_before)), sizeof(depth_before));
     ma2_metal_test_fail_next_submission(renderer);
     CHECK(nv2a_dispatch_clear(&s, 0xf3, 0xffabcdef, 500));
+    // Work is encoded now and fails when it is completed.
+    nv2a_dispatch_sync_all();
     CHECK(nv2a_dispatch_failed() && nv2a_dispatch_discard_frame());
     CHECK(!backend.sync(backend.context));
     CHECK(ma2_metal_last_error(renderer) && std::strstr(ma2_metal_last_error(renderer), "command"));
@@ -1286,10 +1399,10 @@ static bool readback_failure_test(Ma2MetalRenderer *renderer, int error_fd)
     Nv2aVshOutput vertices[3];
     make_triangle(vertices, 10, 0, 1, 0, 1);
     s.depth_test = 1;
-    uint64_t submissions = ma2_metal_test_submission_count(renderer);
+    uint64_t submissions = submitted(renderer);
     ma2_metal_test_fail_next_depth_readback(renderer);
     CHECK(nv2a_dispatch_draw(&s, vertices, 3, 5, nullptr));
-    CHECK(ma2_metal_test_submission_count(renderer) == submissions + 1);
+    CHECK(submitted(renderer) == submissions + 1);
     CHECK(nv2a_dispatch_failed() && nv2a_dispatch_discard_frame());
     CHECK(std::memcmp(before, memory(COLOR, sizeof(before)), sizeof(before)) == 0);
     CHECK(std::memcmp(depth_before, memory(DEPTH, sizeof(depth_before)), sizeof(depth_before)) == 0);
@@ -1310,12 +1423,12 @@ static bool textured_failure_test(Ma2MetalRenderer *renderer, int error_fd)
     uint8_t before[80 * 12], depth_before[96 * 12];
     std::memcpy(before, memory(COLOR, sizeof(before)), sizeof(before));
     std::memcpy(depth_before, memory(DEPTH, sizeof(depth_before)), sizeof(depth_before));
-    uint64_t submissions = ma2_metal_test_submission_count(renderer);
+    uint64_t submissions = submitted(renderer);
     uint64_t commands = ma2_metal_test_command_count(renderer);
     std::memset(fixture_texel_calls, 0, sizeof(fixture_texel_calls));
     ma2_metal_test_fail_next_submission(renderer);
     CHECK(nv2a_dispatch_draw(&s, v, 3, 5, fixture_texel));
-    CHECK(ma2_metal_test_submission_count(renderer) == submissions + 1);
+    CHECK(submitted(renderer) == submissions + 1);
     CHECK(ma2_metal_test_command_count(renderer) == commands + 1);
     CHECK(fixture_texel_calls[1] == 16 && fixture_texel_calls[2] == 16);
     CHECK(nv2a_dispatch_failed() && nv2a_dispatch_discard_frame());
@@ -1375,7 +1488,7 @@ int main(int argc, char **argv)
     else if (argc == 2 && std::strcmp(argv[1], "swizzled-then-linear") == 0)
         ok = mixed_depth_test(renderer, errors[0], true);
     else
-        ok = clear_tests() && draw_tests() && unsupported_tests(renderer) &&
+        ok = clear_tests() && stencil_tests() && draw_tests() && unsupported_tests(renderer) &&
              executor_tests(renderer) && presenter_test() && failure_test(renderer, backend, errors[0]);
     if (!xbox_MemoryLayoutShutdownChecked()) ok = false;
     if (!nv2a_backend_register(nullptr)) ok = false;

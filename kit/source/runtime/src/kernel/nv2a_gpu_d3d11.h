@@ -28,6 +28,13 @@ typedef struct {
     int use_rc, textured, legacy;
     Nv2aCombiner rc;
     Nv2aGpuTexture textures[4];
+    /* SET_ZPASS_PIXEL_COUNT_ENABLE: a backend with exact visibility results
+     * counts this draw's depth-passing samples. */
+    uint32_t zpass_enable;
+    /* Fog factor inputs for backends that receive transformed vertices:
+     * oFog arrives raw, as the vertex program wrote it. */
+    uint32_t fog_enable, fog_mode;
+    float fog_params[2];
 } Nv2aGpuState;
 
 typedef int (*Nv2aGpuTexel)(const Nv2aGpuTexture *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *);

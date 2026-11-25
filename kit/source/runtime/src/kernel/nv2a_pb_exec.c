@@ -101,6 +101,8 @@ static struct {
     float frame_intervals[32768];
     unsigned interval_count,over_16_ms,over_33_ms;
     double longest_interval;
+    /* Visibility-test traffic: how often the title counts, resets and reads. */
+    uint32_t zpass_draws, zpass_toggles, report_clears, report_gets, report_nonzero;
 } s_perf;
 
 enum { PERF_DRAW_SAMPLES=8 };
@@ -321,6 +323,11 @@ static void perf_frame(void)
         }
         /* Keep the existing PERF/PERF-PACING pair adjacent for the capture
          * reader. Extra recognized-tag evidence follows that complete pair. */
+        fprintf(stderr,"[PERF-VISIBILITY] per_frame counted_batches=%.1f toggles=%.1f "
+            "clears=%.1f reports=%.1f nonzero_reports=%.1f\n",
+            (double)s_perf.zpass_draws/s_perf.frames,(double)s_perf.zpass_toggles/s_perf.frames,
+            (double)s_perf.report_clears/s_perf.frames,(double)s_perf.report_gets/s_perf.frames,
+            (double)s_perf.report_nonzero/s_perf.frames);
         perf_report_cpu();
         memset(&s_perf, 0, sizeof(s_perf));
         s_perf.start = now;
@@ -1166,6 +1173,9 @@ static void hardware_state(Nv2aGpuState *g)
     if (nv2a_dispatch_registered() && !s_gpu.zeta_offset) g->depth_va = 0;
 #endif
     g->depth_pitch = s_gpu.zeta_pitch;
+    g->zpass_enable = s_gpu.zpass_enable != 0;
+    g->fog_enable = s_gpu.fog_enable; g->fog_mode = s_gpu.fog_mode;
+    g->fog_params[0] = s_gpu.fog_param[0]; g->fog_params[1] = s_gpu.fog_param[1];
     g->clip_x = s_gpu.clip_x; g->clip_y = s_gpu.clip_y;
     g->clip_w = s_gpu.clip_w; g->clip_h = s_gpu.clip_h;
     g->depth_test = s_gpu.depth_test; g->depth_func = s_gpu.depth_func; g->depth_mask = s_gpu.depth_mask;
@@ -3545,7 +3555,9 @@ static void raster_batch_program(void)
     double profile_start = perf_clock_ms();
 #if defined(__APPLE__)
     int transformed = 0, software_depth = 0;
-    int allow_hardware = !nv2a_dispatch_registered() || !s_gpu.zpass_enable;
+    /* Counted draws leave the CPU only for a backend with exact results. */
+    int allow_hardware = !nv2a_dispatch_registered() || !s_gpu.zpass_enable ||
+                         nv2a_dispatch_visibility();
 #else
     const int allow_hardware = 1;
 #endif
@@ -3869,7 +3881,8 @@ static void raster_batch(void)
         state.textured = s_gpu.texs[0].valid && tc->offset && tc->stride;
         if (hardware_surface_ok(&state)
 #if defined(__APPLE__)
-            && (!nv2a_dispatch_registered() || !s_gpu.zpass_enable)
+            && (!nv2a_dispatch_registered() || !s_gpu.zpass_enable ||
+                nv2a_dispatch_visibility())
 #endif
             ) {
             for (i = 0; i < s_gpu.indices.count; i++) {
@@ -4079,6 +4092,7 @@ static void draw_primitive(void)
         if (profile_start) {
             s_perf.draw_ms += perf_clock_ms() - profile_start;
             s_perf.draws++;
+            if (s_gpu.zpass_enable) s_perf.zpass_draws++;
         }
         if(diagnostic_sample)perf_draw_finish(diagnostic_before);
         if(effect_sample)effect_trace_finish(effect_before,effect_input);
@@ -4912,8 +4926,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
         s_gpu.zpass_count = 0;
+#if defined(__APPLE__)
+        nv2a_dispatch_visibility_reset();
+#endif
+        s_perf.report_clears++;
         break;
     case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
+        if (s_gpu.zpass_enable != param) s_perf.zpass_toggles++;
         s_gpu.zpass_enable = param;
         break;
     case 0x17D0: {                                /* GET_REPORT */
@@ -4927,8 +4946,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         uint32_t at = dma_resolve(param & 0x00FFFFFFu);
         uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
+        uint32_t passed = s_gpu.zpass_count;
+#if defined(__APPLE__)
+        /* Samples counted by a registered backend's hardware draws. */
+        passed += nv2a_dispatch_visibility_count();
+#endif
+        s_perf.report_gets++;
+        if (passed) s_perf.report_nonzero++;
         memcpy(mem + at, &stamp, 8);
-        memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
+        memcpy(mem + at + 8, &passed, 4);
         memset(mem + at + 12, 0, 4);
         break;
     }

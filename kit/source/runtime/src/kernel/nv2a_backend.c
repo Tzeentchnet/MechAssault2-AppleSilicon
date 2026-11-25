@@ -34,6 +34,10 @@ int nv2a_backend_register(const Nv2aBackend *backend)
     COPY_OPTIONAL(present_sync);
     COPY_OPTIONAL(surface_info);
     COPY_OPTIONAL(report_failure);
+    COPY_OPTIONAL(visibility_reset);
+    COPY_OPTIONAL(visibility_count);
+    if (!s_backend.visibility_reset || !s_backend.visibility_count)
+        s_backend.visibility_reset = NULL, s_backend.visibility_count = NULL;
 #undef COPY_OPTIONAL
     s_registered = 1;
     s_failed = 0;
@@ -65,6 +69,22 @@ int nv2a_dispatch_registered(void) { return s_registered; }
 uint64_t nv2a_dispatch_registration_epoch(void) { return s_registration_epoch; }
 #endif
 int nv2a_dispatch_failed(void) { return s_registered && s_failed; }
+int nv2a_dispatch_visibility(void) { return s_registered && s_backend.visibility_count != NULL; }
+void nv2a_dispatch_visibility_reset(void)
+{
+    if (s_registered && !s_failed && s_backend.visibility_reset)
+        s_backend.visibility_reset(s_backend.context);
+}
+uint32_t nv2a_dispatch_visibility_count(void)
+{
+    uint32_t count = 0;
+    if (!s_registered || s_failed || !s_backend.visibility_count) return 0;
+    if (!s_backend.visibility_count(s_backend.context, &count)) {
+        backend_error("visibility result");
+        return 0;
+    }
+    return count;
+}
 int nv2a_dispatch_discard_frame(void) { return s_registered ? s_failed : nv2a_gpu_discard_frame(); }
 int nv2a_dispatch_program_pending(void) { return s_registered ? 0 : nv2a_gpu_program_pending(); }
 int nv2a_dispatch_clear(const Nv2aGpuState *s, uint32_t mask, uint32_t color, float depth)

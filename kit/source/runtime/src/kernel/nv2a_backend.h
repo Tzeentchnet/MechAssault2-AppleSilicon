@@ -57,6 +57,15 @@ typedef struct Nv2aBackend {
     /* Optional notification for executor-side interop failures. The
      * dispatcher has already marked the frame as failed when this is called. */
     void (*report_failure)(void *, const char *operation);
+    /* Optional exact visibility results. A backend supplying both callbacks
+     * receives draws issued while SET_ZPASS_PIXEL_COUNT_ENABLE is on, counts
+     * their depth-passing samples, and adds them to the executor's own CPU
+     * count. visibility_reset runs at CLEAR_REPORT_VALUE. visibility_count
+     * runs at GET_REPORT: it completes outstanding work and stores the samples
+     * counted since the last reset; it returns 0 on failure. Without both,
+     * counted draws stay on the CPU path. */
+    void (*visibility_reset)(void *);
+    int (*visibility_count)(void *, uint32_t *count);
 } Nv2aBackend;
 
 /* Register before starting the executor; NULL restores MA2's existing backend.
