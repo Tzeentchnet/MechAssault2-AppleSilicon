@@ -3,15 +3,28 @@
 Goal: native arm64 build that holds **≥ 30 FPS in the front-end menus and in
 active campaign missions**, with no CPU fallback in steady state.
 
-Where we are (2026-11-25, branch `apple-silicon/bringup`, uncommitted):
+Where we are (2026-11-25, branch `apple-silicon/bringup`):
 
 - `nv2a_metal.mm` is a GPU-resident Metal renderer. It has exact visibility
   counts, cube maps, stencil (`Depth32Float_Stencil8`) and fog factors that
   match the CPU path.
-- Menu: **1.27 → ~9.4 FPS**. The only menu decline left is G8B8 render targets.
+- Menu (title screen, idle, 60 s, `perf_probe.sh`):
+
+  | Step | Median FPS | GPU waits / 60 s | Declined draws |
+  |---|---|---|---|
+  | Resident renderer (earlier session) | ~9.4 | n/a | G8B8 surfaces |
+  | + G8B8 render targets | 7.3* | 8,186 | 1,364 (border colour) |
+  | + any texture border colour | 10.0 | 11,852 | 0 |
+  | + GPU render-to-texture (colour) | 12.0 | 1,600 | 0 |
+  | + GPU depth-as-texture | **12.9** | **833** (≈1/frame) | **0** |
+
+  \*Different screen from the earlier ~9.4: keypresses were not delivered.
+- The menu now has no fallbacks and no mid-frame GPU waits. The pushbuffer
+  thread is CPU-bound, and **~68% of it is CPU vertex programs**
+  (`execute_program`). That is Phase 3 and now the biggest item.
 - `RECOMP_PERF=1` logs `[PERF]`, `[PERF-VISIBILITY]` and `[NV2A-METAL]` lines:
-  accepted and declined draws, declines grouped by reason, and the first few
-  sampled declines of each kind.
+  accepted and declined draws, declines grouped by reason, render-to-texture
+  blits and reuses, sampled declines, and textures that force a write-back.
 - Missions have not been measured yet.
 
 Why declines matter: each declined draw falls back to the CPU rasterizer. That
@@ -22,22 +35,25 @@ decline per frame can cost more than the rest of the frame.
 
 ## Phase 0: Measurement you can trust (do first; it gates everything else)
 
-- [ ] **Clean profiling environment.** Earlier profiling failed because macOS
-  background services took most of the CPU and startup took 17 minutes. Before
-  each run:
+- [ ] **Clean profiling environment.** Before each run:
   - Check `top -o cpu` / Activity Monitor. Wait for Spotlight (`mds_stores`),
     `photoanalysisd`, `backupd` and similar to settle, or exclude the game,
     build and cache folders from Spotlight.
   - Use AC power and turn Low Power Mode off.
   - Record the start time. Abort and investigate if startup is far over the
     usual time; a slow start is a symptom in its own right, not noise.
-- [ ] **Startup time investigation.** Find out whether the 17-minute start was
-  only contention or a cold cache (shader, texture, translated code, disc
-  I/O). Add a `[PERF-STARTUP]` line with phase timings.
-- [ ] **One perf-probe script in the repo** (no private paths). It launches
-  with `RECOMP_PERF=1`, drives input to a fixed point, captures N seconds and
-  prints a summary: FPS, p50/p99 frame time, declines by reason, GPU waits per
-  frame, and texture-upload MB per frame.
+- [x] **Startup time.** Solved: the game draws **~7 s** after launch. The
+  "17-minute startup" was the probe waiting for `runtime-private.log`, which is
+  only written with `MA2_PRIVATE_DIAGNOSTICS=1`.
+- [x] **Perf-probe script:** `tools/apple_silicon/perf_probe.sh` (no private
+  paths). It runs an isolated HOME with `RECOMP_PERF=1`, waits for drawing,
+  captures N seconds plus an optional `sample` profile, and prints FPS, the
+  last Metal counters and decline samples.
+  - [ ] Input: keypresses use System Events, which needs Accessibility
+    permission for the terminal. Grant it, or add an in-process scripted input
+    hook, so runs can reach the main menu and a mission.
+  - [ ] Add p50/p99 frame time (needs per-frame timestamps, not the 5 s
+    `[PERF]` average).
 - [ ] **Fixed benchmark scenes.** Pick three and keep them:
   1. main menu idle,
   2. first mission, first 60 s after the HUD appears (reuse the
@@ -55,22 +71,23 @@ for a mission.
 
 ## Phase 1: Zero fallback in the menu
 
-- [x] **G8B8 render targets (NV2A surface format `0xA`).** *(Done 2026-11-25:
-  resident BGRA8 texture with only green and blue writable, R=0 and A=1,
-  packed to 16 bits on load and write-back, as in the D3D11 backend. Covered
-  by `g8b8_tests` in `metal_backend_test`. Still to do: a retail menu run.)* These 16-bit,
-  two-channel targets are the last thing forcing CPU fallback in the menu. Map
-  them to `MTLPixelFormatRG8Unorm` with a swizzle or shader remap so the
-  channel order and the replication when sampled as a texture match the CPU
-  path. Check:
-  - write-back layout when the guest reads the surface,
-  - aliasing with the same memory read as a texture,
-  - blending.
-  Add a `metal_backend_test` case against the CPU oracle.
-- [ ] Re-run the menu with `RECOMP_PERF=1` and confirm `declines: none`.
-- [ ] Fix the CPU fallback in `nv2a_pb_exec.c`: it packs G8B8 surfaces as
-  R5G6B5 (writes, blending, clears and `trace_cpu_pixel`), so it no longer
-  matches the GPU paths for this format.
+- [x] **G8B8 render targets (NV2A surface format `0xA`).** A resident BGRA8
+  texture with only green and blue writable (R=0, A=1), packed to 16 bits on
+  load and write-back, as in the D3D11 backend. Tested by `g8b8_tests`.
+- [x] **Any texture border colour.** The menu samples its G8B8 target
+  (`LIN_G8B8`, `0x17`) with border colour `0x80808080`, which Metal samplers
+  cannot express. The sampler now uses a transparent-black border and the
+  shader adds `border × (1 − filter coverage)`. This is exact for
+  single-level, nearest or bilinear sampling, as the CPU path samples.
+  Mipmapped or cube textures with custom borders still decline.
+- [x] Menu re-run with `RECOMP_PERF=1`: **`declines: none`**.
+- [x] Fixed the CPU fallback in `nv2a_pb_exec.c`, which packed G8B8 as R5G6B5.
+  Tested by `backend_executor_g8b8_surface`.
+- [x] **GPU render-to-texture.** A linear texture that is exactly a resident
+  surface (`0x12`/`0x1E` from A8R8G8B8, `0x17` from G8B8, `0x12`/`0x1E` from
+  Z24S8 depth) is copied on the GPU in command order. There is no write-back,
+  no wait and no texel decode. Copies are reused while the source's version is
+  unchanged. Tested by `render_to_texture_tests`.
 - [ ] **Turn decline logging into a regression gate.** A bounded test route
   fails if any decline reason other than an allow-listed one appears.
 
@@ -117,6 +134,10 @@ per-frame sync, uploads and vertex work (Phase 3).
 
 ## Phase 4: Textures and uploads
 
+- [ ] Extend GPU render-to-texture to swizzled formats (`0x06`/`0x07`/`0x28`)
+  and to sub-rectangles of a surface, if missions use them. Watch for
+  `[NV2A-METAL] texture writeback` lines.
+
 - [ ] **Faster texture-cache misses.** Decoding currently runs one texel at a
   time.
   - Unswizzle by rows and tiles with a Morton lookup table (the toolkit's D3D11
@@ -132,7 +153,8 @@ per-frame sync, uploads and vertex work (Phase 3).
 
 ## Phase 5: CPU and GPU overlap (frames in flight)
 
-- [ ] **Stop waiting on the GPU every frame.** `finish()` waits on every
+- [ ] **Stop waiting on the GPU every frame.** (The menu is down to about one
+  wait per frame, for presentation.) `finish()` waits on every
   in-flight command buffer. Keep it only for real guest synchronization:
   - CPU reads of a GPU surface,
   - `GET_REPORT` / visibility results the guest actually polls,
