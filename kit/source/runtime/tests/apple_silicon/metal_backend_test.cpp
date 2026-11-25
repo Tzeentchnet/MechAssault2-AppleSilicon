@@ -1032,6 +1032,61 @@ static bool texture_decline_tests(Ma2MetalRenderer *renderer)
     return true;
 }
 
+static bool near16(uint16_t value, unsigned g, unsigned b)
+{
+    return std::abs((int)(value >> 8) - (int)g) <= 1 && std::abs((int)(value & 255) - (int)b) <= 1;
+}
+
+/* G8B8 (colour format 0xA) stays on the GPU: 16-bit pixels with G high and
+ * B low; red and alpha are never written. Matches the D3D11 backend. */
+static bool g8b8_tests(Ma2MetalRenderer *renderer)
+{
+    Nv2aGpuState s = state();
+    s.color_va = OTHER; s.pitch = 40; s.bpp = 2; s.format = 0x12a;
+    s.clip_x = 1; s.clip_y = 1; s.clip_w = 14; s.clip_h = 10;
+    std::memset(memory(OTHER, 40 * 12), 0x33, 40 * 12);
+    uint64_t count = submitted(renderer);
+
+    CHECK(nv2a_dispatch_clear(&s, 0xf0, 0xff123456, 0));
+    CHECK(read16(OTHER, 40, 4, 3) == 0x3456u);
+    CHECK(read16(OTHER, 40, 0, 3) == 0x3333u);
+    CHECK(read16(OTHER, 40, 15, 3) == 0x3333u);
+    CHECK(read16(OTHER, 40, 4, 11) == 0x3333u);
+    CHECK(nv2a_dispatch_clear(&s, 0x20, 0xffffab00, 0));
+    CHECK(read16(OTHER, 40, 4, 3) == 0xab56u);
+    // Red and alpha only: nothing in a G8B8 surface changes.
+    CHECK(nv2a_dispatch_clear(&s, 0x90, 0xffffffff, 0));
+    CHECK(read16(OTHER, 40, 4, 3) == 0xab56u);
+
+    Nv2aVshOutput v[3];
+    make_triangle(v, 0, 1, 0.5f, 0.25f, 1);
+    CHECK(nv2a_dispatch_draw(&s, v, 3, 5, nullptr));
+    CHECK(near16(read16(OTHER, 40, 4, 3), 128, 64));
+    CHECK(read16(OTHER, 40, 0, 3) == 0x3333u);
+    CHECK(read16(OTHER, 40, 12, 9) == 0xab56u);  // inside the clip, outside the triangle
+
+    // Blend against the stored G:B (dst alpha reads as 1).
+    CHECK(nv2a_dispatch_clear(&s, 0xf0, 0xff000080, 0));
+    s.blend_enable = 1; s.blend_src = 0x302; s.blend_dst = 0x303; s.blend_equation = 0x8006;
+    make_triangle(v, 0, 0, 1, 0, 0.5f);
+    CHECK(nv2a_dispatch_draw(&s, v, 3, 5, nullptr));
+    CHECK(near16(read16(OTHER, 40, 4, 3), 128, 64));
+    s.blend_enable = 0;
+
+    // Guest writes reload into the texture: blue-only draw keeps the guest's G.
+    uint8_t *pixel = memory(OTHER, 40 * 12) + 3 * 40 + 4 * 2;
+    uint16_t guest = 0x12ff;
+    std::memcpy(pixel, &guest, 2);
+    s.color_mask = 0x00000001u;
+    make_triangle(v, 0, 1, 1, 0, 1);
+    CHECK(nv2a_dispatch_draw(&s, v, 3, 5, nullptr));
+    CHECK(read16(OTHER, 40, 4, 3) == 0x1200u);
+
+    CHECK(submitted(renderer) > count);
+    CHECK(!nv2a_dispatch_failed());
+    return true;
+}
+
 static bool unsupported_tests(Ma2MetalRenderer *renderer)
 {
     Nv2aGpuState s = state();
@@ -1488,7 +1543,8 @@ int main(int argc, char **argv)
     else if (argc == 2 && std::strcmp(argv[1], "swizzled-then-linear") == 0)
         ok = mixed_depth_test(renderer, errors[0], true);
     else
-        ok = clear_tests() && stencil_tests() && draw_tests() && unsupported_tests(renderer) &&
+        ok = clear_tests() && stencil_tests() && draw_tests() && g8b8_tests(renderer) &&
+             unsupported_tests(renderer) &&
              executor_tests(renderer) && presenter_test() && failure_test(renderer, backend, errors[0]);
     if (!xbox_MemoryLayoutShutdownChecked()) ok = false;
     if (!nv2a_backend_register(nullptr)) ok = false;

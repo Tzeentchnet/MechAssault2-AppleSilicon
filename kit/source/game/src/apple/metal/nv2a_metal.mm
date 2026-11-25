@@ -51,6 +51,21 @@ constexpr uint64_t kTextureCacheBytes = UINT64_C(512) << 20;
 constexpr size_t kMaxTargets = 64;
 constexpr uint32_t kMinTargetExtent = 1024;
 
+/* NV2A colour surface formats (NV097_SET_SURFACE_FORMAT_COLOR). G8B8 is
+ * 16-bit with G in the high byte and B in the low byte. Like the D3D11
+ * backend, it is mirrored in a BGRA8 texture whose red and alpha stay 0 and
+ * 1 (only green and blue are ever written) and packed back on write-back. */
+constexpr uint32_t kColorR5G6B5 = 3, kColorA8R8G8B8 = 8, kColorG8B8 = 0xA;
+
+/* Colour formats a draw or a resident clear can target. */
+static bool resident_color(uint32_t format) { return format == kColorA8R8G8B8 || format == kColorG8B8; }
+
+/* Clear-mask bits (0x10 R .. 0x80 A) that land in a surface of this format. */
+static uint32_t clear_color_bits(uint32_t format)
+{
+    return format == kColorR5G6B5 ? 0x70u : format == kColorG8B8 ? 0x60u : 0xf0u;
+}
+
 struct Surface {
     uint32_t va, pitch, bpp;
     size_t bytes;
@@ -329,7 +344,8 @@ static bool geometry(const Nv2aGpuState *s, Geometry &g)
     if (!s || (s->format & 0xf000u) || ((s->format >> 8) & 15u) > 1u)
         return false;
     uint32_t format = s->format & 15u;
-    if (!((format == 8 && s->bpp == 4) || (format == 3 && s->bpp == 2)) ||
+    if (!((format == kColorA8R8G8B8 && s->bpp == 4) ||
+          ((format == kColorR5G6B5 || format == kColorG8B8) && s->bpp == 2)) ||
         !s->pitch || s->pitch % s->bpp)
         return false;
     uint64_t right = (uint64_t)s->clip_x + s->clip_w;
@@ -627,9 +643,24 @@ static bool write_back_color(Ma2MetalRenderer *m, Resident &r)
         return false;
     }
     ++m->color_writebacks;
-    [r.texture getBytes:base + (size_t)d.y0 * r.pitch + (size_t)d.x0 * 4
-            bytesPerRow:r.pitch fromRegion:MTLRegionMake2D(d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0)
-            mipmapLevel:0];
+    MTLRegion region = MTLRegionMake2D(d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0);
+    if (r.bpp == 4) {
+        [r.texture getBytes:base + (size_t)d.y0 * r.pitch + (size_t)d.x0 * 4
+                bytesPerRow:r.pitch fromRegion:region mipmapLevel:0];
+    } else {
+        // G8B8: BGRA8 texel little-endian is B,G,R,A, so the low half is G:B.
+        uint32_t w = d.x1 - d.x0, h = d.y1 - d.y0;
+        std::vector<uint32_t> pixels((size_t)w * h);
+        [r.texture getBytes:pixels.data() bytesPerRow:(NSUInteger)w * 4
+                 fromRegion:region mipmapLevel:0];
+        for (uint32_t y = 0; y < h; ++y) {
+            uint8_t *row = base + (size_t)(d.y0 + y) * r.pitch + (size_t)d.x0 * 2;
+            for (uint32_t x = 0; x < w; ++x) {
+                uint16_t packed = (uint16_t)pixels[(size_t)y * w + x];
+                memcpy(row + (size_t)x * 2, &packed, 2);
+            }
+        }
+    }
     r.dirty.clear();
     ++m->epoch;
     return true;
@@ -655,8 +686,23 @@ static bool load(Ma2MetalRenderer *m, Resident &r)
     }
     if (!r.depth) {
         ++m->color_loads;
-        [r.texture replaceRegion:MTLRegionMake2D(0, 0, r.width, r.height) mipmapLevel:0
-                       withBytes:base bytesPerRow:r.pitch];
+        MTLRegion region = MTLRegionMake2D(0, 0, r.width, r.height);
+        if (r.bpp == 4) {
+            [r.texture replaceRegion:region mipmapLevel:0 withBytes:base bytesPerRow:r.pitch];
+        } else {
+            // G8B8 expands to A=1, R=0, G:B from the guest's 16 bits.
+            std::vector<uint32_t> pixels((size_t)r.width * r.height);
+            for (uint32_t y = 0; y < r.height; ++y) {
+                const uint8_t *row = base + (size_t)y * r.pitch;
+                for (uint32_t x = 0; x < r.width; ++x) {
+                    uint16_t packed;
+                    memcpy(&packed, row + (size_t)x * 2, 2);
+                    pixels[(size_t)y * r.width + x] = 0xff000000u | packed;
+                }
+            }
+            [r.texture replaceRegion:region mipmapLevel:0 withBytes:pixels.data()
+                         bytesPerRow:(NSUInteger)r.width * 4];
+        }
         r.stale = false;
         return true;
     }
@@ -967,13 +1013,22 @@ static void attachment_formats(MTLRenderPipelineDescriptor *desc, MTLPixelFormat
         depth == MTLPixelFormatDepth32Float_Stencil8 ? depth : MTLPixelFormatInvalid;
 }
 
+/* Channels a draw may write: G8B8 has no red or alpha. */
+static MTLColorWriteMask surface_write_mask(uint32_t format, MTLColorWriteMask mask)
+{
+    if (format == kColorG8B8)
+        mask = (MTLColorWriteMask)(mask & (MTLColorWriteMaskGreen | MTLColorWriteMaskBlue));
+    return mask;
+}
+
 static id<MTLRenderPipelineState> pipeline(Ma2MetalRenderer *m, const Nv2aGpuState *s,
                                            MTLPixelFormat depth)
 {
     bool shaded = s->use_rc || s->textured;
-    NSString *key = [NSString stringWithFormat:@"d%u:%u:%u:%u:%u:%u:%u:%lu",
+    uint32_t cformat = s->format & 15u;
+    NSString *key = [NSString stringWithFormat:@"d%u:%u:%u:%u:%u:%u:%u:%lu:%u",
         s->depth_test != 0, s->blend_enable != 0, s->blend_src, s->blend_dst,
-        s->blend_equation, s->color_mask, shaded, (unsigned long)depth];
+        s->blend_equation, s->color_mask, shaded, (unsigned long)depth, cformat];
     id<MTLRenderPipelineState> cached = m->pipelines[key];
     if (cached) return cached;
     MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
@@ -983,7 +1038,7 @@ static id<MTLRenderPipelineState> pipeline(Ma2MetalRenderer *m, const Nv2aGpuSta
     attachment_formats(desc, depth);
     MTLRenderPipelineColorAttachmentDescriptor *attachment = desc.colorAttachments[0];
     attachment.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    attachment.writeMask = color_write_mask(s->color_mask);
+    attachment.writeMask = surface_write_mask(cformat, color_write_mask(s->color_mask));
     attachment.blendingEnabled = s->blend_enable != 0;
     if (s->blend_enable) {
         MTLBlendFactor sr, sa, dr, da;
@@ -1198,7 +1253,7 @@ static int clear_impl(Ma2MetalRenderer *m, const Nv2aGpuState *s, uint32_t mask,
     Geometry g;
     if (!geometry(s, g) || (mask & ~0xf3u)) return 0;
     uint32_t cformat = s->format & 15u, zformat = (s->format >> 4) & 15u;
-    bool color_write = (mask & (cformat == 3 ? 0x70u : 0xf0u)) != 0;
+    bool color_write = (mask & clear_color_bits(cformat)) != 0;
     bool depth_write = (mask & 1u) != 0;
     bool stencil_write = (mask & 2u) != 0;
     if (stencil_write && zformat == 1) stencil_write = false;
@@ -1208,7 +1263,7 @@ static int clear_impl(Ma2MetalRenderer *m, const Nv2aGpuState *s, uint32_t mask,
     if (depth_write && (!std::isfinite(depth_value) || depth_value < 0 ||
                         depth_value > max_depth || std::trunc(depth_value) != depth_value))
         return 0;
-    if (cformat == 3)
+    if (cformat == kColorR5G6B5)
         return clear_unresident(m, s, g, mask, color, depth_value,
                                 color_write, depth_write, stencil_write);
 
@@ -1220,7 +1275,7 @@ static int clear_impl(Ma2MetalRenderer *m, const Nv2aGpuState *s, uint32_t mask,
     bool declined = false;
     Resident *target = nullptr, *depth = nullptr;
     if (color_write) {
-        target = resident(m, false, s->color_va, s->pitch, 4, cformat, g.height, nullptr, declined);
+        target = resident(m, false, s->color_va, s->pitch, s->bpp, cformat, g.height, nullptr, declined);
         if (!target) return declined && !m->failed ? 0 : 1;
     }
     if (depth_write || stencil_write) {
@@ -1242,7 +1297,7 @@ static int clear_impl(Ma2MetalRenderer *m, const Nv2aGpuState *s, uint32_t mask,
         if (mask & 0x20u) bits |= MTLColorWriteMaskGreen;
         if (mask & 0x40u) bits |= MTLColorWriteMaskBlue;
         if (mask & 0x80u) bits |= MTLColorWriteMaskAlpha;
-        write_mask = (MTLColorWriteMask)bits;
+        write_mask = surface_write_mask(cformat, (MTLColorWriteMask)bits);
     }
     DepthStencil clear_test;
     clear_test.write = depth_write;
@@ -1815,7 +1870,8 @@ static int draw_impl(Ma2MetalRenderer *m, const Nv2aGpuState *s, const Nv2aVshOu
                      uint32_t count, uint32_t primitive, Nv2aGpuTexel texel)
 {
     Geometry g;
-    if (!geometry(s, g) || (s->format & 15u) != 8)
+    uint32_t cformat = s->format & 15u;
+    if (!geometry(s, g) || !resident_color(cformat))
         return decline_draw(m, DeclineSurface, s, v, count, primitive);
     DepthStencil test;
     uint32_t zformat_check = (s->format >> 4) & 15u;
@@ -1875,7 +1931,8 @@ static int draw_impl(Ma2MetalRenderer *m, const Nv2aGpuState *s, const Nv2aVshOu
         }
     }
     bool declined = false;
-    Resident *target = resident(m, false, s->color_va, s->pitch, 4, 8, g.height, nullptr, declined);
+    Resident *target = resident(m, false, s->color_va, s->pitch, s->bpp, cformat, g.height,
+                                nullptr, declined);
     if (!target) return declined && !m->failed ? decline(m, DeclineSurface) : 1;
     Resident *depth = nullptr;
     if (needs_depth) {
@@ -1934,7 +1991,8 @@ static int draw_impl(Ma2MetalRenderer *m, const Nv2aGpuState *s, const Nv2aVshOu
                             alpha:(c >> 24) / 255.0f];
     }
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertices.size()];
-    if (s->color_mask & 0x01010101u) target->dirty.add(g.x, g.y, g.w, g.h);
+    if (s->color_mask & (cformat == kColorG8B8 ? 0x00000101u : 0x01010101u))
+        target->dirty.add(g.x, g.y, g.w, g.h);
     if (depth && ((s->depth_test && s->depth_mask) || writes_stencil(test)))
         depth->dirty.add(g.x, g.y, g.w, g.h);
     after_draw(m);
