@@ -1258,6 +1258,30 @@ static uint32_t surface_bpp(void)
     return s_gpu.pitch / s_gpu.clip_w;
 }
 
+/* 16-bit colour surfaces. G8B8 (format 0xA) keeps G in the high byte and B
+ * in the low byte; red and alpha are not stored. Every other 16-bit format
+ * is treated as R5G6B5. Matches the D3D11 and Metal backends. */
+static int surface_g8b8(void)
+{
+    return (s_gpu.format & 0xF) == 0xA;
+}
+
+static uint16_t pack_surface16(uint32_t argb)
+{
+    if (surface_g8b8())
+        return (uint16_t)argb;
+    return (uint16_t)(((argb >> 8) & 0xF800) | ((argb >> 5) & 0x07E0)
+                    | ((argb >> 3) & 0x001F));
+}
+
+static uint32_t unpack_surface16(uint32_t pixel)
+{
+    if (surface_g8b8())
+        return 0xFF000000u | pixel;
+    return 0xFF000000u | ((pixel & 0xF800u) << 8) | ((pixel & 0x07E0u) << 5)
+         | ((pixel & 0x001Fu) << 3);
+}
+
 
 /* Write the current surface out as a 24-bit BMP.
  *
@@ -1459,9 +1483,7 @@ static int clear_surface(uint32_t param)
         uint32_t sh = 1u << ((s_gpu.format >> 24) & 15u);
         uint32_t x0 = s_gpu.clip_x, x1 = s_gpu.clip_x + s_gpu.clip_w;
         uint32_t y0 = s_gpu.clip_y, y1 = s_gpu.clip_y + s_gpu.clip_h;
-        uint16_t v16 = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                | ((s_gpu.clear_color >> 3) & 0x001F));
+        uint16_t v16 = pack_surface16(s_gpu.clear_color);
         if (s_gpu.clear_rect_set == 3) {
             x0 = s_gpu.clear_x;
             x1 = s_gpu.clear_x + s_gpu.clear_w;
@@ -1488,10 +1510,8 @@ static int clear_surface(uint32_t param)
                 p[x] = s_gpu.clear_color;
         } else if (bpp == 2) {
             /* The clear value is always given as A8R8G8B8; a 16-bit surface
-             * takes the same colour reduced to 5:6:5. */
-            uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                  | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                  | ((s_gpu.clear_color >> 3) & 0x001F));
+             * takes the same colour reduced to 5:6:5, or its G:B for G8B8. */
+            uint16_t v = pack_surface16(s_gpu.clear_color);
             uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
             for (x = 0; x < s_gpu.clip_w; x++)
                 p[x] = v;
@@ -1833,9 +1853,7 @@ static int trace_cpu_pixel(uint32_t x,uint32_t y,uint32_t *argb)
     size_t index=surface_index((int)x,(int)y,&row);
     if(bpp==4)*argb=((const uint32_t *)row)[index];
     else if(bpp==2){
-        uint32_t pixel=((const uint16_t *)row)[index];
-        *argb=0xff000000u|((pixel&0xf800u)<<8)|((pixel&0x07e0u)<<5)|
-              ((pixel&0x001fu)<<3);
+        *argb=unpack_surface16(((const uint16_t *)row)[index]);
     }else return 0;
     return 1;
 }
@@ -1906,9 +1924,7 @@ static void put_pixel_internal(uint8_t *mem, uint32_t bpp, int x, int y,
         if (bpp == 4) {
             dst = ((const uint32_t *)row)[xi];
         } else if (bpp == 2) {
-            uint32_t t = ((const uint16_t *)row)[xi];
-            dst = 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
-                | ((t & 0x001Fu) << 3);
+            dst = unpack_surface16(((const uint16_t *)row)[xi]);
         }
         for (k = 0; k < 4; k++) {           /* r g b a, 0..1 */
             int sh = k == 3 ? 24 : 16 - 8 * k;
@@ -1941,17 +1957,14 @@ static void put_pixel_internal(uint8_t *mem, uint32_t bpp, int x, int y,
         if (bpp == 4) {
             old = ((const uint32_t *)row)[xi];
         } else {
-            uint32_t t = ((const uint16_t *)row)[xi];
-            old = ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5) | ((t & 0x001Fu) << 3);
+            old = unpack_surface16(((const uint16_t *)row)[xi]);
         }
         argb = (argb & ~keep) | (old & keep);
     }
     if (bpp == 4) {
         ((uint32_t *)row)[xi] = argb;
     } else if (bpp == 2) {
-        ((uint16_t *)row)[xi] = (uint16_t)(((argb >> 8) & 0xF800)
-                                         | ((argb >> 5) & 0x07E0)
-                                         | ((argb >> 3) & 0x001F));
+        ((uint16_t *)row)[xi] = pack_surface16(argb);
     }
 }
 

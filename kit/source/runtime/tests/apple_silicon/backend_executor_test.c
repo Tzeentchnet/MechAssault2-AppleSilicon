@@ -416,6 +416,46 @@ static int test_parallel_raster(void)
     return 0;
 }
 
+/* G8B8 (colour format 0xA): 16-bit pixels with G high and B low, no red or
+ * alpha. The CPU path must pack it as the D3D11 and Metal backends do, not
+ * as R5G6B5. */
+static int test_g8b8_surface(void)
+{
+    enum { W = 64, H = 64, POS = RENDER + W * H * 2, DIFF = POS + 0x100 };
+    static const float positions[6][3] = {
+        {8, 8, 0}, {48, 8, 0}, {48, 48, 0},
+        {8, 8, 0}, {48, 48, 0}, {8, 48, 0}
+    };
+    uint16_t *surface = xbox_TranslateMappedRam(RENDER, W * H * 2);
+    float *position = xbox_TranslateMappedRam(POS, sizeof(positions));
+    uint32_t *diffuse = xbox_TranslateMappedRam(DIFF, 6 * sizeof(*diffuse));
+    CHECK(surface && position && diffuse);
+
+    memset(surface, 0, W * H * 2);
+    nv2a_pb_exec_method(0, 0x0200, W << 16);
+    nv2a_pb_exec_method(0, 0x0204, H << 16);
+    nv2a_pb_exec_method(0, 0x0208, 0xAu);
+    nv2a_pb_exec_method(0, 0x020c, W * 2);
+    nv2a_pb_exec_method(0, 0x0210, RENDER);
+    nv2a_pb_exec_method(0, 0x1d90, 0xff123456u);
+    nv2a_pb_exec_method(0, 0x1d94, 0xf0);
+    CHECK(surface[5 * W + 5] == 0x3456u);
+
+    memcpy(position, positions, sizeof(positions));
+    for (unsigned i = 0; i < 6; ++i)
+        diffuse[i] = 0xff8040c0u;
+    nv2a_pb_exec_method(0, 0x1720, POS);
+    nv2a_pb_exec_method(0, 0x1760, 2u | (3u << 4) | (12u << 8));
+    nv2a_pb_exec_method(0, 0x172c, DIFF);
+    nv2a_pb_exec_method(0, 0x176c, 4u << 4 | 4u << 8);
+    nv2a_pb_exec_method(0, 0x17fc, 5);
+    nv2a_pb_exec_method(0, 0x1810, 5u << 24);
+    nv2a_pb_exec_method(0, 0x17fc, 0);
+    CHECK(surface[20 * W + 20] == 0x40c0u);
+    CHECK(surface[5 * W + 5] == 0x3456u);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     uint8_t xbe[0x1000] = {0};
@@ -428,6 +468,13 @@ int main(int argc, char **argv)
         xbox_FramebufferHostClose();
         xbox_MemoryLayoutShutdown();
         puts("NV2A executor: swizzled partial clear and draw passed");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "g8b8-surface") == 0) {
+        CHECK(test_g8b8_surface() == 0);
+        xbox_FramebufferHostClose();
+        xbox_MemoryLayoutShutdown();
+        puts("NV2A executor: G8B8 clear and draw passed");
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "strip-culling") == 0) {

@@ -62,6 +62,7 @@ target_link_libraries(backend_executor_test PRIVATE xboxrecomp SDL2::SDL2)
 add_test(NAME backend_executor COMMAND backend_executor_test)
 add_test(NAME backend_executor_swizzled_surface COMMAND backend_executor_test swizzled-surface)
 add_test(NAME backend_executor_strip_culling COMMAND backend_executor_test strip-culling)
+add_test(NAME backend_executor_g8b8_surface COMMAND backend_executor_test g8b8-surface)
 add_test(NAME backend_executor_texture_addressing COMMAND backend_executor_test texture-addressing)
 add_test(NAME backend_executor_texture_dependencies COMMAND backend_executor_test texture-dependencies)
 add_test(NAME backend_executor_combiner_gate COMMAND backend_executor_test combiner-gate)
@@ -69,6 +70,7 @@ add_test(NAME backend_executor_parallel_raster COMMAND backend_executor_test par
 set_tests_properties(backend_executor PROPERTIES
     ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
 set_tests_properties(backend_executor_swizzled_surface backend_executor_strip_culling
+    backend_executor_g8b8_surface
     backend_executor_texture_addressing backend_executor_texture_dependencies
 backend_executor_combiner_gate backend_executor_parallel_raster PROPERTIES
     ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
